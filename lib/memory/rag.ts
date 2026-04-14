@@ -11,6 +11,7 @@ type MatchRow = { id: number; content: string; similarity: number | null };
 export async function buildMemorySystemPrompt(
   supabase: SupabaseClient,
   filterUserId: string,
+  filterOrgId: string,
   userQuery: string,
   matchCount: number,
 ): Promise<string | undefined> {
@@ -29,6 +30,7 @@ export async function buildMemorySystemPrompt(
     query_embedding: vectorToPgString(embedding),
     match_count: matchCount,
     filter_user_id: filterUserId,
+    filter_org_id: filterOrgId,
   });
 
   if (error) {
@@ -53,6 +55,7 @@ export async function buildMemorySystemPrompt(
 export async function persistConversationMemory(
   supabase: SupabaseClient,
   userId: string,
+  orgId: string,
   userText: string,
   assistantText: string,
 ): Promise<void> {
@@ -70,6 +73,7 @@ export async function persistConversationMemory(
   }
 
   const { error } = await supabase.from("memories").insert({
+    org_id: orgId,
     user_id: userId,
     content,
     embedding: vectorToPgString(embedding),
@@ -77,6 +81,12 @@ export async function persistConversationMemory(
   });
 
   if (error) {
-    console.warn("memory persist: insert failed", error.message);
+    console.error(
+      "memory persist: insert failed",
+      error.message,
+      error.code,
+      error.details,
+      error.hint,
+    );
   }
 }

@@ -6,7 +6,11 @@ import {
   buildMemorySystemPrompt,
   persistConversationMemory,
 } from '@/lib/memory/rag';
-import { createServiceRoleClient, isMemoryStorageConfigured } from '@/lib/supabase/service';
+import {
+  createServiceRoleClient,
+  getMemoryOrgId,
+  isMemoryStorageConfigured,
+} from '@/lib/supabase/service';
 
 const modelName = process.env.OLLAMA_MODEL || 'gemma2:9b';
 
@@ -29,6 +33,7 @@ export async function POST(req: Request) {
     const memoryOn = isMemoryFeatureEnabled();
     const supabase = memoryOn ? createServiceRoleClient() : null;
     const memoryUserId = process.env.MEMORY_USER_ID;
+    const memoryOrgId = getMemoryOrgId();
     const lastUserText = getLastUserText(messages);
 
     let systemPrompt: string | undefined;
@@ -36,6 +41,7 @@ export async function POST(req: Request) {
       systemPrompt = await buildMemorySystemPrompt(
         supabase,
         memoryUserId,
+        memoryOrgId,
         lastUserText,
         Number.parseInt(process.env.MEMORY_MATCH_COUNT || '5', 10) || 5,
       );
@@ -55,7 +61,13 @@ export async function POST(req: Request) {
         if (!memoryOn || !supabase || !memoryUserId || !lastUserText || !text?.trim()) {
           return;
         }
-        await persistConversationMemory(supabase, memoryUserId, lastUserText, text);
+        await persistConversationMemory(
+          supabase,
+          memoryUserId,
+          memoryOrgId,
+          lastUserText,
+          text,
+        );
       },
     });
 

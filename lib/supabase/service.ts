@@ -28,3 +28,8 @@ export function isMemoryStorageConfigured(): boolean {
       process.env.MEMORY_USER_ID,
   );
 }
+
+/** 与表 memories.org_id 一致；未设置时用固定占位，避免 NOT NULL 约束导致插入失败 */
+export function getMemoryOrgId(): string {
+  return process.env.MEMORY_ORG_ID?.trim() || "local-dev";
+}
