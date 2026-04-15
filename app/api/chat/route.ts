@@ -38,22 +38,50 @@ function isMemoryFeatureEnabled(): boolean {
   return isMemoryStorageConfigured();
 }
 
-function isLikelyChinese(text: string | undefined): boolean {
-  if (!text) return false;
-  return /[\u4e00-\u9fff]/.test(text);
+type ReplyLanguage = "same" | "zh" | "en" | "nl" | "ja";
+
+function detectExplicitReplyLanguage(text: string | undefined): ReplyLanguage | undefined {
+  if (!text) return undefined;
+  const t = text.toLowerCase();
+
+  if (
+    /荷兰语|荷蘭語|nederlands|dutch/.test(t) ||
+    /(会说|會說|speak).*(荷兰语|荷蘭語|dutch|nederlands)/.test(t)
+  ) {
+    return "nl";
+  }
+  if (/中文|汉语|漢語|chinese|mandarin/.test(t)) return "zh";
+  if (/英语|英語|english/.test(t)) return "en";
+  if (/日语|日語|japanese|日本語/.test(t)) return "ja";
+  return undefined;
+}
+
+function detectInputLanguage(text: string | undefined): ReplyLanguage {
+  if (!text) return "same";
+  if (/[\u4e00-\u9fff]/.test(text)) return "zh";
+  if (/[\u3040-\u30ff]/.test(text)) return "ja";
+  return "same";
 }
 
 function buildCombinedSystemPrompt(
   l2Summary?: string,
   l3Memory?: string,
-  preferredLanguage: "zh" | "same" = "same",
+  preferredLanguage: ReplyLanguage = "same",
 ): string | undefined {
   const sections: string[] = [];
-  const behaviorPrompt =
-    preferredLanguage === "zh"
-      ? "请默认使用简体中文回答，除非用户明确要求其他语言。语气自然、简洁、口语化。"
-      : "Reply in the same language as the user. Keep responses natural and concise.";
+  const languagePolicyByPreference: Record<ReplyLanguage, string> = {
+    same:
+      "Reply in the same language as the user unless they explicitly request another language. Keep responses natural and concise.",
+    zh: "请使用简体中文回答，除非用户明确要求其他语言。语气自然、简洁、口语化。",
+    en: "Please answer in English unless the user explicitly requests another language.",
+    nl: "Beantwoord in het Nederlands, tenzij de gebruiker expliciet om een andere taal vraagt.",
+    ja: "ユーザーが明示的に別言語を求めない限り、日本語で回答してください。",
+  };
+  const behaviorPrompt = languagePolicyByPreference[preferredLanguage];
   sections.push(`[Response Policy]\n${behaviorPrompt}`);
+  sections.push(
+    "[Identity]\nYou are a local AI model running in Ollama. Never claim to be OpenAI/ChatGPT/GPT-3.5.",
+  );
 
   if (l2Summary?.trim()) {
     sections.push(["[L2 Session Summary]", l2Summary.trim()].join("\n"));
@@ -82,7 +110,8 @@ export async function POST(req: Request) {
     const memoryOrgId = getMemoryOrgId();
     const lastUserText = getLastUserText(messages);
     const userTurns = countUserTurns(messages);
-    const preferredLanguage: "zh" | "same" = isLikelyChinese(lastUserText) ? "zh" : "same";
+    const preferredLanguage: ReplyLanguage =
+      detectExplicitReplyLanguage(lastUserText) || detectInputLanguage(lastUserText);
 
     let l2SummaryText: string | undefined;
     let l3MemoryPrompt: string | undefined;

@@ -18,11 +18,40 @@ function textFromMessage(message: UIMessage): string {
     .trim();
 }
 
+const LOW_SIGNAL_PATTERNS = [
+  /^(hi|hello|你好|在吗|有人吗|早上好|中午好|晚上好)[!,.?，。！？ ]*$/i,
+  /^(谢谢|好的|收到|ok|okay)[!,.?，。！？ ]*$/i,
+];
+
+function normalizeTitleSeed(text: string): string {
+  return text
+    .replace(/\s+/g, " ")
+    .replace(/^[#>*`\-\d.\s]+/, "")
+    .replace(/^(请你|请|帮我|麻烦你|能不能|可以帮我|请帮我)\s*/i, "")
+    .replace(/[“”"'`]+/g, "")
+    .trim();
+}
+
+function truncateTitle(text: string, max = 22): string {
+  if (text.length <= max) return text;
+  const slice = text.slice(0, max);
+  const cleaned = slice.replace(/[，。！？,.!?;；:：、\s]+$/g, "").trim();
+  return cleaned || slice.trim();
+}
+
 export function buildConversationTitle(messages: UIMessage[]): string {
-  const firstUser = messages.find((m) => m.role === "user");
-  const seed = firstUser ? textFromMessage(firstUser) : "";
-  if (!seed) return "新对话";
-  return seed.slice(0, 24);
+  for (const message of messages) {
+    if (message.role !== "user") continue;
+    const raw = textFromMessage(message);
+    if (!raw) continue;
+    if (LOW_SIGNAL_PATTERNS.some((p) => p.test(raw))) continue;
+
+    const normalized = normalizeTitleSeed(raw);
+    if (!normalized) continue;
+    return truncateTitle(normalized, 22);
+  }
+
+  return `新对话 ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
 }
 
 export function buildLastPreview(messages: UIMessage[]): string {

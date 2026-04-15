@@ -1,7 +1,10 @@
 'use client';
 import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+
+const WARMUP_INTERVAL_MS = 5 * 60 * 1000;
+const WARMUP_IDLE_STOP_MS = 30 * 60 * 1000;
 
 type ConversationItem = {
   id: string;
@@ -11,7 +14,7 @@ type ConversationItem = {
 };
 
 export default function Chat() {
-  const { messages, setMessages, sendMessage, status, error, clearError } = useChat({
+  const { messages, setMessages, sendMessage, regenerate, stop, status, error, clearError } = useChat({
     transport: new DefaultChatTransport({ api: '/api/chat' }),
   });
   const [input, setInput] = useState('');
@@ -23,6 +26,8 @@ export default function Chat() {
   const [activeConversationId, setActiveConversationId] = useState<string>('');
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
+  const [keepWarmEnabled, setKeepWarmEnabled] = useState(true);
+  const lastActivityAtRef = useRef(Date.now());
   const isBusy = status === 'submitted' || status === 'streaming';
 
   useEffect(() => {
@@ -115,6 +120,11 @@ export default function Chat() {
 
   const handleCreateConversation = async () => {
     if (isBusy) return;
+    // 避免在“已是空白新会话”时重复创建会话壳。
+    if (activeConversationId && messages.length === 0 && !isLoadingMessages) {
+      return;
+    }
+
     const response = await fetch('/api/conversations', { method: 'POST' });
     const data = (await response.json()) as {
       conversation?: { id: string; title: string };
@@ -140,6 +150,7 @@ export default function Chat() {
     setMessages([]);
     setInput('');
     setConversationsError('');
+    lastActivityAtRef.current = Date.now();
   };
 
   const renderedMessages = useMemo(
@@ -154,6 +165,7 @@ export default function Chat() {
       })),
     [messages],
   );
+  const canRetry = !isBusy && renderedMessages.length > 0;
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -164,6 +176,7 @@ export default function Chat() {
     if (!activeConversationId) return;
 
     if (error) clearError();
+    lastActivityAtRef.current = Date.now();
     await sendMessage(
       { text: value },
       { body: { model: selectedModel, conversationId: activeConversationId } },
@@ -171,9 +184,57 @@ export default function Chat() {
     setInput('');
   };
 
+  const handleRetry = async () => {
+    if (!activeConversationId || isBusy || renderedMessages.length === 0) return;
+    if (error) clearError();
+    lastActivityAtRef.current = Date.now();
+    await regenerate({ body: { model: selectedModel, conversationId: activeConversationId } });
+  };
+
+  useEffect(() => {
+    const bumpActivity = () => {
+      lastActivityAtRef.current = Date.now();
+    };
+    window.addEventListener('pointerdown', bumpActivity);
+    window.addEventListener('keydown', bumpActivity);
+
+    return () => {
+      window.removeEventListener('pointerdown', bumpActivity);
+      window.removeEventListener('keydown', bumpActivity);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!keepWarmEnabled || !selectedModel) return;
+
+    const warmup = async () => {
+      const now = Date.now();
+      if (now - lastActivityAtRef.current > WARMUP_IDLE_STOP_MS) return;
+      if (isBusy) return;
+
+      try {
+        await fetch('/api/warmup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: selectedModel }),
+        });
+      } catch {
+        // best-effort keep-warm; ignore transient errors
+      }
+    };
+
+    // Warm once after model switch / resume, then keep alive on interval.
+    void warmup();
+    const timer = window.setInterval(() => {
+      void warmup();
+    }, WARMUP_INTERVAL_MS);
+
+    return () => window.clearInterval(timer);
+  }, [keepWarmEnabled, selectedModel, isBusy]);
+
   return (
-    <div className="flex min-h-screen bg-slate-50 text-slate-900">
-      <aside className="hidden w-72 flex-col border-r border-slate-200 bg-[#f7f8fa] p-4 md:flex">
+    <div className="flex h-screen overflow-hidden bg-slate-50 text-slate-900">
+      <aside className="hidden h-full w-72 flex-col border-r border-slate-200 bg-[#f7f8fa] p-4 md:flex">
         <button
           type="button"
           className="mb-4 rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:bg-slate-400"
@@ -183,7 +244,10 @@ export default function Chat() {
           + 发起新对话
         </button>
         <p className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-500">历史对话</p>
-        <div className="space-y-1 overflow-y-auto">
+        <div
+          className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1"
+          onWheel={(event) => event.stopPropagation()}
+        >
           {isLoadingConversations && <p className="px-2 py-1 text-xs text-slate-400">加载中...</p>}
           {!isLoadingConversations &&
             conversations.map((item) => (
@@ -210,7 +274,8 @@ export default function Chat() {
         </div>
       </aside>
 
-      <main className="mx-auto flex min-h-screen w-full max-w-4xl flex-col px-4 pb-40 pt-8">
+      <main className="h-full w-full overflow-y-auto px-4 pb-40 pt-8">
+        <div className="mx-auto flex w-full max-w-4xl flex-col">
         <header className="mb-6">
           <div className="mb-3 flex items-center justify-between gap-3 md:hidden">
             <button
@@ -224,39 +289,15 @@ export default function Chat() {
             <span className="text-xs text-slate-400">{conversations.length} 个会话</span>
           </div>
           <p className="text-sm font-medium text-slate-500">本地 AI 助手（Ollama）</p>
-          <div className="mt-3 flex items-center gap-2">
-            <label htmlFor="model-select" className="text-xs font-medium text-slate-500">
-              当前模型
-            </label>
-            <select
-              id="model-select"
-              value={selectedModel}
-              onChange={(event) => setSelectedModel(event.target.value)}
-              className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700"
-              disabled={isBusy || models.length === 0}
-            >
-              {models.length === 0 ? (
-                <option value={selectedModel}>{selectedModel}</option>
-              ) : (
-                models.map((model) => (
-                  <option key={model} value={model}>
-                    {model}
-                  </option>
-                ))
-              )}
-            </select>
-          </div>
           {renderedMessages.length === 0 && (
             <h1 className="mt-1 text-3xl font-semibold tracking-tight text-slate-800">今天想让我帮你做什么？</h1>
           )}
         </header>
 
-        <section className="flex-1 space-y-4">
-          {renderedMessages.length === 0 && (
+        <section className="space-y-4" onWheel={(event) => event.stopPropagation()}>
+          {renderedMessages.length === 0 && isLoadingMessages && (
             <div className="rounded-2xl border border-slate-200 bg-white p-5 text-sm text-slate-500 shadow-sm">
-              {isLoadingMessages
-                ? '正在加载会话...'
-                : '试试这样提问：帮我总结这段文本 / 帮我写一封邮件 / 帮我规划今天任务'}
+              正在加载会话...
             </div>
           )}
 
@@ -265,12 +306,12 @@ export default function Chat() {
             return (
               <div key={message.id} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
                 {isUser ? (
-                  <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl bg-slate-900 px-4 py-3 text-sm leading-6 text-white shadow-sm">
+                  <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl bg-slate-200 px-4 py-3 text-sm leading-6 text-slate-900 shadow-sm">
                     {message.text}
                   </div>
                 ) : (
-                  <div className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm leading-6 text-slate-800 shadow-sm">
-                    <div className="mb-2 flex items-center gap-2">
+                  <div className="w-full px-2 py-1 text-sm leading-7 text-slate-800">
+                    <div className="mb-2 flex items-center gap-2 text-slate-500">
                       <span className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-slate-300 bg-white text-slate-900 shadow-sm">
                         <svg viewBox="0 0 64 64" className="h-6 w-6" aria-hidden="true">
                           <g fill="none" stroke="currentColor" strokeWidth="3.2" strokeLinecap="round" strokeLinejoin="round">
@@ -293,35 +334,89 @@ export default function Chat() {
             );
           })}
         </section>
+        </div>
       </main>
 
       <form
         onSubmit={handleSubmit}
-        className="fixed inset-x-0 bottom-0 border-t border-slate-200 bg-white/90 backdrop-blur"
+        className="fixed inset-x-0 bottom-0 border-t border-slate-200 bg-white/90 backdrop-blur md:left-72"
       >
-        <div className="mx-auto flex w-full max-w-3xl items-end gap-3 px-4 py-4">
-          <textarea
-            className="max-h-40 min-h-12 w-full resize-y rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 shadow-sm outline-none transition focus:border-slate-500 disabled:bg-slate-100"
-            value={input}
-            placeholder="输入你的问题，回车发送（Shift+Enter 换行）"
-            onChange={(event) => setInput(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault();
-                void handleSubmit(event as unknown as FormEvent<HTMLFormElement>);
-              }
-            }}
-            disabled={isBusy || !activeConversationId}
-          />
-          <button
-            type="submit"
-            className="h-12 rounded-2xl bg-slate-900 px-5 text-sm font-medium text-white transition hover:bg-slate-700 disabled:bg-slate-400"
-            disabled={isBusy || !input.trim() || !activeConversationId}
-          >
-            发送
-          </button>
+        <div className="mx-auto w-full max-w-4xl px-4 py-4">
+          <div className="rounded-3xl border border-slate-300 bg-white px-4 py-3 shadow-sm">
+            <textarea
+              className="max-h-40 min-h-12 w-full resize-y bg-transparent text-sm text-slate-900 outline-none transition disabled:bg-slate-100"
+              value={input}
+              placeholder="输入你的问题，回车发送（Shift+Enter 换行）"
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault();
+                  void handleSubmit(event as unknown as FormEvent<HTMLFormElement>);
+                }
+              }}
+              disabled={isBusy || !activeConversationId}
+            />
+            <div className="mt-3 flex items-center justify-between gap-3 border-t border-slate-100 pt-3">
+              <div className="flex items-center gap-3">
+                <label htmlFor="model-select" className="text-xs font-medium text-slate-500">
+                  当前模型
+                </label>
+                <select
+                  id="model-select"
+                  value={selectedModel}
+                  onChange={(event) => setSelectedModel(event.target.value)}
+                  className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700"
+                  disabled={isBusy || models.length === 0}
+                >
+                  {models.length === 0 ? (
+                    <option value={selectedModel}>{selectedModel}</option>
+                  ) : (
+                    models.map((model) => (
+                      <option key={model} value={model}>
+                        {model}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <label className="inline-flex items-center gap-1 text-xs text-slate-500">
+                  <input
+                    type="checkbox"
+                    checked={keepWarmEnabled}
+                    onChange={(event) => setKeepWarmEnabled(event.target.checked)}
+                    className="h-3.5 w-3.5 rounded border-slate-300"
+                  />
+                  常热
+                </label>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  className="h-10 rounded-xl border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:text-slate-400"
+                  onClick={() => stop()}
+                  disabled={!isBusy}
+                >
+                  停止
+                </button>
+                <button
+                  type="button"
+                  className="h-10 rounded-xl border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:text-slate-400"
+                  onClick={() => void handleRetry()}
+                  disabled={!canRetry || !activeConversationId}
+                >
+                  重试
+                </button>
+                <button
+                  type="submit"
+                  className="h-10 rounded-xl bg-slate-900 px-4 text-xs font-medium text-white transition hover:bg-slate-700 disabled:bg-slate-400"
+                  disabled={isBusy || !input.trim() || !activeConversationId}
+                >
+                  发送
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
-        <div className="mx-auto w-full max-w-3xl px-4 pb-4 text-xs">
+        <div className="mx-auto w-full max-w-4xl px-4 pb-4 text-xs">
           {isBusy && <p className="text-slate-500">AI 正在回复...</p>}
           {modelsError && <p className="text-amber-600">{modelsError}</p>}
           {error && <p className="text-red-500">连接失败，请确认 Ollama 服务已启动。</p>}
