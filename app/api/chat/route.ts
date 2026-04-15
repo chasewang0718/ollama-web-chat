@@ -12,11 +12,13 @@ import {
   runMemoryHealthCheck,
 } from "@/lib/memory/rag";
 import {
-  getLatestSummary,
-  persistSummary,
   shouldRefreshSummary,
   summarizeConversationWithOllama,
 } from "@/lib/memory/summary";
+import {
+  getConversationSummary,
+  saveConversationState,
+} from "@/lib/chat/conversations";
 import {
   createServiceRoleClient,
   getMemoryOrgId,
@@ -67,7 +69,11 @@ function buildCombinedSystemPrompt(
 
 export async function POST(req: Request) {
   try {
-    const { messages, model } = (await req.json()) as { messages: UIMessage[]; model?: string };
+    const { messages, model, conversationId } = (await req.json()) as {
+      messages: UIMessage[];
+      model?: string;
+      conversationId?: string;
+    };
     const activeModel = model || modelName;
 
     const memoryOn = isMemoryFeatureEnabled();
@@ -81,9 +87,13 @@ export async function POST(req: Request) {
     let l2SummaryText: string | undefined;
     let l3MemoryPrompt: string | undefined;
 
-    if (memoryOn && supabase && memoryUserId) {
-      const latestSummary = await getLatestSummary(supabase, memoryUserId, memoryOrgId);
-      l2SummaryText = latestSummary?.summary;
+    if (memoryOn && supabase && memoryUserId && conversationId) {
+      l2SummaryText = await getConversationSummary(
+        supabase,
+        memoryUserId,
+        memoryOrgId,
+        conversationId,
+      );
     }
 
     if (memoryOn && supabase && memoryUserId && lastUserText) {
@@ -93,6 +103,7 @@ export async function POST(req: Request) {
         memoryOrgId,
         lastUserText,
         Number.parseInt(process.env.MEMORY_MATCH_COUNT || "5", 10) || 5,
+        conversationId,
       );
     }
 
@@ -112,7 +123,23 @@ export async function POST(req: Request) {
           return;
         }
 
-        await persistConversationMemory(supabase, memoryUserId, memoryOrgId, lastUserText, text);
+        await persistConversationMemory(
+          supabase,
+          memoryUserId,
+          memoryOrgId,
+          lastUserText,
+          text,
+          conversationId,
+        );
+
+        const conversationMessages: UIMessage[] = [
+          ...messages,
+          {
+            id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-assistant`,
+            role: "assistant",
+            parts: [{ type: "text", text }],
+          } as UIMessage,
+        ];
 
         const healthInterval =
           Number.parseInt(process.env.MEMORY_HEALTHCHECK_INTERVAL || "20", 10) || 20;
@@ -122,6 +149,13 @@ export async function POST(req: Request) {
 
         const interval = Number.parseInt(process.env.MEMORY_SUMMARY_INTERVAL || "8", 10) || 8;
         if (!shouldRefreshSummary(userTurns, interval)) {
+          await saveConversationState(
+            supabase,
+            memoryUserId,
+            memoryOrgId,
+            conversationId || "default",
+            conversationMessages,
+          );
           return;
         }
 
@@ -133,9 +167,14 @@ export async function POST(req: Request) {
           l2SummaryText,
           activeModel,
         );
-        if (!generatedSummary) return;
-
-        await persistSummary(supabase, memoryUserId, memoryOrgId, generatedSummary, userTurns);
+        await saveConversationState(
+          supabase,
+          memoryUserId,
+          memoryOrgId,
+          conversationId || "default",
+          conversationMessages,
+          generatedSummary,
+        );
       },
     });
 

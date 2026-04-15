@@ -43,6 +43,11 @@ function stripMemoryMeta(content: string): string {
     .trim();
 }
 
+function getConversationTag(content: string): string | undefined {
+  const match = content.match(/\[conversation_id=([^\]]+)\]/);
+  return match?.[1];
+}
+
 function stableMemoryKey(userText: string): string {
   const normalized = compactWhitespace(userText).toLowerCase();
   return createHash("sha1").update(normalized).digest("hex").slice(0, 12);
@@ -217,6 +222,7 @@ export async function buildMemorySystemPrompt(
   filterOrgId: string,
   userQuery: string,
   matchCount: number,
+  conversationId?: string,
 ): Promise<string | undefined> {
   const trimmed = userQuery.trim();
   if (!trimmed) return undefined;
@@ -229,9 +235,10 @@ export async function buildMemorySystemPrompt(
     return undefined;
   }
 
+  const expandedCount = conversationId ? Math.max(matchCount * 6, 30) : matchCount;
   const { data, error } = await supabase.rpc("match_memories", {
     query_embedding: vectorToPgString(embedding),
-    match_count: matchCount,
+    match_count: expandedCount,
     filter_user_id: filterUserId,
     filter_org_id: filterOrgId,
     min_similarity: Number.parseFloat(process.env.MEMORY_MIN_SIMILARITY || "0.55") || 0.55,
@@ -242,7 +249,12 @@ export async function buildMemorySystemPrompt(
     return undefined;
   }
 
-  const rows = rerankRows((data || []) as MatchRow[]);
+  const rows = rerankRows(
+    ((data || []) as MatchRow[]).filter((row) => {
+      if (!conversationId) return true;
+      return getConversationTag(row.content) === conversationId;
+    }),
+  );
   if (rows.length === 0) return undefined;
 
   const lines = rows
@@ -264,6 +276,7 @@ export async function persistConversationMemory(
   orgId: string,
   userText: string,
   assistantText: string,
+  conversationId?: string,
 ): Promise<void> {
   if (!shouldPersistMemory(userText, assistantText)) {
     return;
@@ -277,7 +290,8 @@ export async function persistConversationMemory(
     0,
     8000,
   );
-  let content = `[memory_key=${key}][version=1]\n${baseContent}`;
+  const conversationTag = conversationId ? `[conversation_id=${conversationId}]` : "";
+  let content = `[memory_key=${key}][version=1]${conversationTag}\n${baseContent}`;
   let nextVersion = 1;
 
   let embedding: number[];
@@ -303,9 +317,14 @@ export async function persistConversationMemory(
     console.warn("memory merge: semantic lookup failed", semanticError.message);
   }
 
-  const semanticHit = (semanticRows?.[0] || undefined) as
-    | { id: number; content: string; similarity: number | null }
-    | undefined;
+  const semanticHit = ((semanticRows || []) as Array<{
+    id: number;
+    content: string;
+    similarity: number | null;
+  }>).find((row) => {
+    if (!conversationId) return true;
+    return getConversationTag(row.content) === conversationId;
+  });
 
   let updateExistingId: number | undefined;
   if (semanticHit) {
@@ -319,7 +338,8 @@ export async function persistConversationMemory(
     if (meta.key) key = meta.key;
     const previousVersion = meta.version || 1;
     nextVersion = previousVersion + 1;
-    content = `[memory_key=${key}][version=${nextVersion}]\n${baseContent}`;
+    const sameConversationTag = conversationId ? `[conversation_id=${conversationId}]` : "";
+    content = `[memory_key=${key}][version=${nextVersion}]${sameConversationTag}\n${baseContent}`;
     updateExistingId = semanticHit.id;
     embedding = await embedText(content);
   }
