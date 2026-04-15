@@ -6,24 +6,14 @@ import {
   formatRecentConversation,
   getLastUserText,
 } from "@/lib/memory/messages";
+import { bindConversationBackend, getConversationBackend } from "@/lib/storage/bindings";
 import {
-  buildMemorySystemPrompt,
-  persistConversationMemory,
-  runMemoryHealthCheck,
-} from "@/lib/memory/rag";
-import {
-  shouldRefreshSummary,
-  summarizeConversationWithOllama,
-} from "@/lib/memory/summary";
-import {
-  getConversationSummary,
-  saveConversationState,
-} from "@/lib/chat/conversations";
-import {
-  createServiceRoleClient,
-  getMemoryOrgId,
-  isMemoryStorageConfigured,
-} from "@/lib/supabase/service";
+  getControlPlaneStorageProvider,
+  getStorageMode,
+  getStorageProviderForBackend,
+  resolveDefaultBackendForNewConversation,
+} from "@/lib/storage/router";
+import { getMemoryOrgId } from "@/lib/supabase/service";
 
 const modelName = process.env.OLLAMA_MODEL || "gemma2:9b";
 
@@ -34,8 +24,7 @@ const ollama = createOpenAICompatible({
 });
 
 function isMemoryFeatureEnabled(): boolean {
-  if (process.env.MEMORY_ENABLED === "false") return false;
-  return isMemoryStorageConfigured();
+  return process.env.MEMORY_ENABLED !== "false";
 }
 
 type ReplyLanguage = "same" | "zh" | "en" | "nl" | "ja";
@@ -97,17 +86,53 @@ function buildCombinedSystemPrompt(
 
 export async function POST(req: Request) {
   try {
+    const controlPlane = getControlPlaneStorageProvider();
     const { messages, model, conversationId } = (await req.json()) as {
       messages: UIMessage[];
       model?: string;
       conversationId?: string;
     };
-    const activeModel = model || modelName;
-
-    const memoryOn = isMemoryFeatureEnabled();
-    const supabase = memoryOn ? createServiceRoleClient() : null;
     const memoryUserId = process.env.MEMORY_USER_ID;
     const memoryOrgId = getMemoryOrgId();
+    const bindingClient = controlPlane.createServiceRoleClient();
+    const backend = conversationId && bindingClient && memoryUserId
+      ? await getConversationBackend(bindingClient, memoryUserId, memoryOrgId, conversationId)
+      : undefined;
+    let selectedBackend = backend || resolveDefaultBackendForNewConversation(getStorageMode());
+
+    // Legacy compatibility for pre-binding conversations in hybrid mode:
+    // probe both backends, then persist binding once source is identified.
+    if (!backend && conversationId && memoryUserId && getStorageMode() === "hybrid") {
+      const cloudStorage = getStorageProviderForBackend("cloud");
+      const cloudMessages = await cloudStorage.conversation.getMessages(
+        memoryUserId,
+        memoryOrgId,
+        conversationId,
+      );
+      if (cloudMessages.length > 0) {
+        selectedBackend = "cloud";
+      } else {
+        const localStorage = getStorageProviderForBackend("local");
+        const localMessages = await localStorage.conversation.getMessages(
+          memoryUserId,
+          memoryOrgId,
+          conversationId,
+        );
+        if (localMessages.length > 0) {
+          selectedBackend = "local";
+        }
+      }
+
+      if (bindingClient) {
+        await bindConversationBackend(bindingClient, memoryUserId, memoryOrgId, conversationId, selectedBackend);
+      }
+    }
+
+    const storage = getStorageProviderForBackend(selectedBackend);
+    const activeModel = model || modelName;
+
+    const supabase = storage.createServiceRoleClient();
+    const memoryOn = isMemoryFeatureEnabled() && Boolean(supabase && memoryUserId);
     const lastUserText = getLastUserText(messages);
     const userTurns = countUserTurns(messages);
     const preferredLanguage: ReplyLanguage =
@@ -117,8 +142,7 @@ export async function POST(req: Request) {
     let l3MemoryPrompt: string | undefined;
 
     if (memoryOn && supabase && memoryUserId && conversationId) {
-      l2SummaryText = await getConversationSummary(
-        supabase,
+      l2SummaryText = await storage.conversation.getSummary(
         memoryUserId,
         memoryOrgId,
         conversationId,
@@ -126,7 +150,7 @@ export async function POST(req: Request) {
     }
 
     if (memoryOn && supabase && memoryUserId && lastUserText) {
-      l3MemoryPrompt = await buildMemorySystemPrompt(
+      l3MemoryPrompt = await storage.memory.buildSystemPrompt(
         supabase,
         memoryUserId,
         memoryOrgId,
@@ -152,7 +176,7 @@ export async function POST(req: Request) {
           return;
         }
 
-        await persistConversationMemory(
+        await storage.memory.persistTurn(
           supabase,
           memoryUserId,
           memoryOrgId,
@@ -173,37 +197,35 @@ export async function POST(req: Request) {
         const healthInterval =
           Number.parseInt(process.env.MEMORY_HEALTHCHECK_INTERVAL || "20", 10) || 20;
         if (userTurns > 0 && userTurns % healthInterval === 0) {
-          await runMemoryHealthCheck(supabase, memoryUserId, memoryOrgId);
+          await storage.memory.runHealthCheck(supabase, memoryUserId, memoryOrgId);
         }
 
         const interval = Number.parseInt(process.env.MEMORY_SUMMARY_INTERVAL || "8", 10) || 8;
-        if (!shouldRefreshSummary(userTurns, interval)) {
-          await saveConversationState(
-            supabase,
-            memoryUserId,
-            memoryOrgId,
-            conversationId || "default",
-            conversationMessages,
-          );
+        if (!storage.summary.shouldRefresh(userTurns, interval)) {
+          await storage.conversation.saveState({
+            userId: memoryUserId,
+            orgId: memoryOrgId,
+            conversationId: conversationId || "default",
+            messages: conversationMessages,
+          });
           return;
         }
 
         const recentConversation = formatRecentConversation(messages, 14);
         if (!recentConversation.trim()) return;
 
-        const generatedSummary = await summarizeConversationWithOllama(
+        const generatedSummary = await storage.summary.generate(
           recentConversation,
           l2SummaryText,
           activeModel,
         );
-        await saveConversationState(
-          supabase,
-          memoryUserId,
-          memoryOrgId,
-          conversationId || "default",
-          conversationMessages,
-          generatedSummary,
-        );
+        await storage.conversation.saveState({
+          userId: memoryUserId,
+          orgId: memoryOrgId,
+          conversationId: conversationId || "default",
+          messages: conversationMessages,
+          summary: generatedSummary,
+        });
       },
     });
 

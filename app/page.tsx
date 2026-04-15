@@ -1,7 +1,7 @@
 'use client';
 import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 const WARMUP_INTERVAL_MS = 5 * 60 * 1000;
 const WARMUP_IDLE_STOP_MS = 30 * 60 * 1000;
@@ -11,6 +11,7 @@ type ConversationItem = {
   title: string;
   updated_at: string;
   created_at: string;
+  storage_backend?: 'cloud' | 'local';
 };
 
 type ConversationContextMenuState = {
@@ -18,6 +19,13 @@ type ConversationContextMenuState = {
   x: number;
   y: number;
 } | null;
+
+type MigrationTaskItem = {
+  conversation_id: string;
+  storage_backend: 'cloud' | 'local';
+  migration_status: 'none' | 'pending' | 'running' | 'failed' | 'done';
+  updated_at: string;
+};
 
 export default function Chat() {
   const { messages, setMessages, sendMessage, regenerate, stop, status, error, clearError } = useChat({
@@ -35,7 +43,86 @@ export default function Chat() {
   const [keepWarmEnabled, setKeepWarmEnabled] = useState(true);
   const lastActivityAtRef = useRef(Date.now());
   const [contextMenu, setContextMenu] = useState<ConversationContextMenuState>(null);
+  const [migrationItems, setMigrationItems] = useState<MigrationTaskItem[]>([]);
+  const [migrationOnlyFailed, setMigrationOnlyFailed] = useState(false);
+  const [migrationLoading, setMigrationLoading] = useState(false);
+  const [migrationRunning, setMigrationRunning] = useState(false);
+  const [migrationMessage, setMigrationMessage] = useState('');
   const isBusy = status === 'submitted' || status === 'streaming';
+
+  const getBackendLabel = (backend: ConversationItem['storage_backend']) => {
+    if (backend === 'local') return '本地';
+    if (backend === 'cloud') return '云端';
+    return '未知';
+  };
+
+  const loadMigrationItems = useCallback(async (onlyFailed = migrationOnlyFailed) => {
+    setMigrationLoading(true);
+    try {
+      const response = await fetch(
+        `/api/storage/migrations?mode=batch&limit=30&offset=0&onlyFailed=${onlyFailed ? 'true' : 'false'}`,
+        { cache: 'no-store' },
+      );
+      const data = (await response.json()) as { items?: MigrationTaskItem[]; error?: string };
+      if (!response.ok) {
+        setMigrationMessage(data.error || '迁移任务读取失败');
+        setMigrationItems([]);
+        return;
+      }
+      setMigrationItems(data.items || []);
+      setMigrationMessage('');
+    } catch {
+      setMigrationMessage('迁移任务读取失败');
+      setMigrationItems([]);
+    } finally {
+      setMigrationLoading(false);
+    }
+  }, [migrationOnlyFailed]);
+
+  const runBatchMigration = async (options: {
+    dryRun?: boolean;
+    onlyFailed?: boolean;
+    rollback?: boolean;
+  }) => {
+    setMigrationRunning(true);
+    setMigrationMessage('');
+    try {
+      const response = await fetch('/api/storage/migrations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: 'batch',
+          targetBackend: 'local',
+          continueOnError: true,
+          limit: 30,
+          offset: 0,
+          onlyFailed: options.onlyFailed || false,
+          rollback: options.rollback || false,
+          dryRun: options.dryRun || false,
+        }),
+      });
+      const data = (await response.json()) as {
+        ok?: boolean;
+        total?: number;
+        succeeded?: number;
+        failed?: number;
+        error?: string;
+      };
+      if (!response.ok || !data.ok) {
+        setMigrationMessage(data.error || `迁移执行失败（成功 ${data.succeeded || 0} / ${data.total || 0}）`);
+      } else {
+        const modeLabel = options.dryRun ? 'DryRun' : options.rollback ? '回滚' : '迁移';
+        setMigrationMessage(
+          `${modeLabel}完成：成功 ${data.succeeded || 0}，失败 ${data.failed || 0}，总计 ${data.total || 0}`,
+        );
+      }
+    } catch {
+      setMigrationMessage('迁移执行失败');
+    } finally {
+      setMigrationRunning(false);
+      await loadMigrationItems(migrationOnlyFailed);
+    }
+  };
 
   useEffect(() => {
     const loadModels = async () => {
@@ -73,7 +160,7 @@ export default function Chat() {
         if (!list.length) {
           const created = await fetch('/api/conversations', { method: 'POST' });
           const createdData = (await created.json()) as {
-            conversation?: { id: string; title: string };
+            conversation?: { id: string; title: string; storage_backend?: 'cloud' | 'local' };
             error?: string;
           };
           if (!created.ok) {
@@ -88,6 +175,7 @@ export default function Chat() {
                 title: createdData.conversation?.title || '新对话',
                 created_at: new Date().toISOString(),
                 updated_at: new Date().toISOString(),
+                storage_backend: createdData.conversation?.storage_backend,
               },
             ]);
             setActiveConversationId(id);
@@ -105,7 +193,8 @@ export default function Chat() {
 
     void loadModels();
     void loadConversations();
-  }, [setMessages]);
+    void loadMigrationItems(false);
+  }, [setMessages, loadMigrationItems]);
 
   useEffect(() => {
     const loadMessages = async () => {
@@ -115,8 +204,26 @@ export default function Chat() {
         const response = await fetch(`/api/conversations/${activeConversationId}/messages`, {
           cache: 'no-store',
         });
-        const data = (await response.json()) as { messages?: typeof messages };
+        const raw = await response.text();
+        const data = (() => {
+          if (!raw.trim()) return { messages: [] } as { messages?: typeof messages };
+          try {
+            return JSON.parse(raw) as { messages?: typeof messages };
+          } catch {
+            return { messages: [] } as { messages?: typeof messages };
+          }
+        })();
+
+        if (!response.ok) {
+          setMessages([]);
+          setConversationsError('读取会话消息失败，请稍后重试。');
+          return;
+        }
+
         setMessages((data.messages || []) as typeof messages);
+      } catch {
+        setMessages([]);
+        setConversationsError('读取会话消息失败，请稍后重试。');
       } finally {
         setIsLoadingMessages(false);
       }
@@ -134,7 +241,7 @@ export default function Chat() {
 
     const response = await fetch('/api/conversations', { method: 'POST' });
     const data = (await response.json()) as {
-      conversation?: { id: string; title: string };
+      conversation?: { id: string; title: string; storage_backend?: 'cloud' | 'local' };
       error?: string;
     };
     if (!response.ok) {
@@ -150,6 +257,7 @@ export default function Chat() {
         title: data.conversation?.title || '新对话',
         created_at: now,
         updated_at: now,
+        storage_backend: data.conversation?.storage_backend,
       },
       ...items,
     ]);
@@ -163,7 +271,7 @@ export default function Chat() {
   const createBlankConversation = async (): Promise<string | undefined> => {
     const created = await fetch('/api/conversations', { method: 'POST' });
     const createdData = (await created.json()) as {
-      conversation?: { id: string; title: string };
+      conversation?: { id: string; title: string; storage_backend?: 'cloud' | 'local' };
       error?: string;
     };
     if (!created.ok || !createdData.conversation?.id) return undefined;
@@ -174,6 +282,7 @@ export default function Chat() {
       title: createdData.conversation.title || '新对话',
       created_at: now,
       updated_at: now,
+      storage_backend: createdData.conversation.storage_backend,
     };
     setConversations((items) => [conversation, ...items]);
     return conversation.id;
@@ -218,6 +327,39 @@ export default function Chat() {
     }
   };
 
+  const handleMigrateConversation = async (
+    conversationId: string,
+    targetBackend: 'cloud' | 'local',
+  ) => {
+    setConversationsError('');
+    try {
+      const response = await fetch('/api/storage/migrations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: 'single',
+          conversationId,
+          targetBackend,
+        }),
+      });
+      const data = (await response.json()) as { error?: string; ok?: boolean };
+      if (!response.ok || data.ok === false) {
+        setConversationsError(data.error || '迁移失败，请稍后重试。');
+        return;
+      }
+
+      setConversations((items) =>
+        items.map((item) =>
+          item.id === conversationId ? { ...item, storage_backend: targetBackend } : item,
+        ),
+      );
+      setMigrationMessage(`会话已迁移到${targetBackend === 'cloud' ? '云端' : '本地'}`);
+      await loadMigrationItems(migrationOnlyFailed);
+    } catch {
+      setConversationsError('迁移失败，请稍后重试。');
+    }
+  };
+
   const renderedMessages = useMemo(
     () =>
       messages.map((message) => ({
@@ -231,6 +373,10 @@ export default function Chat() {
     [messages],
   );
   const canRetry = !isBusy && renderedMessages.length > 0;
+  const contextConversation = contextMenu
+    ? conversations.find((item) => item.id === contextMenu.conversationId)
+    : undefined;
+  const migrationTarget = contextConversation?.storage_backend === 'local' ? 'cloud' : 'local';
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -352,7 +498,56 @@ export default function Chat() {
                     : 'text-slate-600 hover:bg-white'
                 }`}
               >
-                <p className="truncate">{item.title || '新对话'}</p>
+                <div className="flex items-center gap-1.5">
+                  <span
+                    title={`当前存储：${getBackendLabel(item.storage_backend)}`}
+                    className="inline-flex h-4 w-4 items-center justify-center text-slate-500"
+                  >
+                    {item.storage_backend === 'local' ? (
+                      <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" aria-hidden="true">
+                        <g
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.8"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <rect x="3.5" y="5" width="17" height="11.5" rx="2" />
+                          <path d="M8 19h8" />
+                          <path d="M10 16.5v2.5" />
+                          <path d="M14 16.5v2.5" />
+                        </g>
+                      </svg>
+                    ) : item.storage_backend === 'cloud' ? (
+                      <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" aria-hidden="true">
+                        <g
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.8"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <path d="M7.5 18.5h9a4 4 0 0 0 .2-8 5.5 5.5 0 0 0-10.5 1.8 3.4 3.4 0 0 0 1.3 6.2z" />
+                        </g>
+                      </svg>
+                    ) : (
+                      <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" aria-hidden="true">
+                        <g
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.8"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <circle cx="12" cy="12" r="9" />
+                          <path d="M12 16v.01" />
+                          <path d="M12 12a2 2 0 1 0-2-2" />
+                        </g>
+                      </svg>
+                    )}
+                  </span>
+                  <p className="truncate">{item.title || '新对话'}</p>
+                </div>
                 <p className="mt-1 text-[11px] text-slate-400">
                   {new Date(item.updated_at).toLocaleString()}
                 </p>
@@ -362,6 +557,77 @@ export default function Chat() {
             <p className="px-2 py-1 text-xs text-slate-400">暂无历史对话</p>
           )}
           {conversationsError && <p className="px-2 py-2 text-xs text-amber-600">{conversationsError}</p>}
+
+          <div className="mt-4 rounded-xl border border-slate-200 bg-white p-2">
+            <div className="mb-2 flex items-center justify-between">
+              <p className="text-xs font-medium text-slate-600">迁移任务</p>
+              <button
+                type="button"
+                className="text-[11px] text-slate-500 hover:text-slate-700"
+                onClick={() => void loadMigrationItems(migrationOnlyFailed)}
+                disabled={migrationLoading || migrationRunning}
+              >
+                刷新
+              </button>
+            </div>
+            <label className="mb-2 inline-flex items-center gap-1 text-[11px] text-slate-500">
+              <input
+                type="checkbox"
+                checked={migrationOnlyFailed}
+                onChange={(event) => {
+                  const checked = event.target.checked;
+                  setMigrationOnlyFailed(checked);
+                  void loadMigrationItems(checked);
+                }}
+                className="h-3 w-3 rounded border-slate-300"
+                disabled={migrationLoading || migrationRunning}
+              />
+              仅失败项
+            </label>
+            <div className="mb-2 flex flex-wrap gap-1">
+              <button
+                type="button"
+                className="rounded-md border border-slate-300 px-2 py-1 text-[11px] text-slate-700 hover:bg-slate-50 disabled:text-slate-400"
+                onClick={() => void runBatchMigration({ dryRun: true, onlyFailed: migrationOnlyFailed })}
+                disabled={migrationRunning}
+              >
+                DryRun
+              </button>
+              <button
+                type="button"
+                className="rounded-md border border-slate-300 px-2 py-1 text-[11px] text-slate-700 hover:bg-slate-50 disabled:text-slate-400"
+                onClick={() => void runBatchMigration({ onlyFailed: migrationOnlyFailed })}
+                disabled={migrationRunning}
+              >
+                批量迁移
+              </button>
+              <button
+                type="button"
+                className="rounded-md border border-amber-300 px-2 py-1 text-[11px] text-amber-700 hover:bg-amber-50 disabled:text-slate-400"
+                onClick={() => void runBatchMigration({ rollback: true, onlyFailed: migrationOnlyFailed })}
+                disabled={migrationRunning}
+              >
+                批量回滚
+              </button>
+            </div>
+            {migrationMessage && <p className="mb-2 text-[11px] text-slate-600">{migrationMessage}</p>}
+            <div className="max-h-36 space-y-1 overflow-y-auto">
+              {migrationLoading && <p className="text-[11px] text-slate-400">任务加载中...</p>}
+              {!migrationLoading && migrationItems.length === 0 && (
+                <p className="text-[11px] text-slate-400">暂无迁移任务</p>
+              )}
+              {!migrationLoading &&
+                migrationItems.map((item) => (
+                  <div key={item.conversation_id} className="rounded-md bg-slate-50 px-2 py-1 text-[11px]">
+                    <p className="truncate text-slate-700">{item.conversation_id}</p>
+                    <p className="text-slate-500">
+                      {item.storage_backend} / {item.migration_status}
+                    </p>
+                    <p className="text-slate-400">{new Date(item.updated_at).toLocaleString()}</p>
+                  </div>
+                ))}
+            </div>
+          </div>
         </div>
       </aside>
 
@@ -563,6 +829,18 @@ export default function Chat() {
           >
             重命名
           </button>
+          {contextConversation?.storage_backend && (
+            <button
+              type="button"
+              className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
+              onClick={() => {
+                void handleMigrateConversation(contextMenu.conversationId, migrationTarget);
+                setContextMenu(null);
+              }}
+            >
+              迁移到{migrationTarget === 'cloud' ? '云端' : '本地'}
+            </button>
+          )}
           <div className="my-1 border-t border-slate-100" />
           <button
             type="button"
