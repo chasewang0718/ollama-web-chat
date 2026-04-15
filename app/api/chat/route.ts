@@ -36,8 +36,22 @@ function isMemoryFeatureEnabled(): boolean {
   return isMemoryStorageConfigured();
 }
 
-function buildCombinedSystemPrompt(l2Summary?: string, l3Memory?: string): string | undefined {
+function isLikelyChinese(text: string | undefined): boolean {
+  if (!text) return false;
+  return /[\u4e00-\u9fff]/.test(text);
+}
+
+function buildCombinedSystemPrompt(
+  l2Summary?: string,
+  l3Memory?: string,
+  preferredLanguage: "zh" | "same" = "same",
+): string | undefined {
   const sections: string[] = [];
+  const behaviorPrompt =
+    preferredLanguage === "zh"
+      ? "请默认使用简体中文回答，除非用户明确要求其他语言。语气自然、简洁、口语化。"
+      : "Reply in the same language as the user. Keep responses natural and concise.";
+  sections.push(`[Response Policy]\n${behaviorPrompt}`);
 
   if (l2Summary?.trim()) {
     sections.push(["[L2 Session Summary]", l2Summary.trim()].join("\n"));
@@ -62,6 +76,7 @@ export async function POST(req: Request) {
     const memoryOrgId = getMemoryOrgId();
     const lastUserText = getLastUserText(messages);
     const userTurns = countUserTurns(messages);
+    const preferredLanguage: "zh" | "same" = isLikelyChinese(lastUserText) ? "zh" : "same";
 
     let l2SummaryText: string | undefined;
     let l3MemoryPrompt: string | undefined;
@@ -82,7 +97,11 @@ export async function POST(req: Request) {
     }
 
     const baseMessages = await convertToModelMessages(messages);
-    const systemPrompt = buildCombinedSystemPrompt(l2SummaryText, l3MemoryPrompt);
+    const systemPrompt = buildCombinedSystemPrompt(
+      l2SummaryText,
+      l3MemoryPrompt,
+      preferredLanguage,
+    );
 
     const result = await streamText({
       model: ollama.chatModel(activeModel),
@@ -111,6 +130,7 @@ export async function POST(req: Request) {
 
         const generatedSummary = await summarizeConversationWithOllama(
           recentConversation,
+          l2SummaryText,
           activeModel,
         );
         if (!generatedSummary) return;

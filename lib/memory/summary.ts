@@ -58,6 +58,7 @@ export async function persistSummary(
 
 export async function summarizeConversationWithOllama(
   conversationText: string,
+  previousSummary?: string,
   activeModel?: string,
 ): Promise<string | undefined> {
   const host = (process.env.OLLAMA_HOST || "http://127.0.0.1:11434").replace(/\/$/, "");
@@ -68,9 +69,22 @@ export async function summarizeConversationWithOllama(
       : configured;
 
   const system =
-    "You are a memory summarizer. Produce concise stable memory in Chinese with bullet points.\n" +
-    "Keep only durable facts: user preferences, decisions, constraints, style requirements, and unresolved tasks.\n" +
-    "Do not include transient chitchat.";
+    "你是记忆摘要器。请用简体中文输出简洁稳定的要点。\n" +
+    "只保留可长期复用的信息：用户偏好、关键决定、硬约束、风格要求、未完成任务。\n" +
+    "若提供旧摘要，请合并旧摘要并更新变化事实。\n" +
+    "不要写寒暄与临时闲聊。";
+
+  const userPrompt = previousSummary?.trim()
+    ? [
+        "已有摘要：",
+        previousSummary.trim(),
+        "",
+        "新增对话：",
+        conversationText,
+        "",
+        "任务：仅输出更新后的中文要点摘要。",
+      ].join("\n")
+    : `请总结以下对话，输出中文要点：\n\n${conversationText}`;
 
   const response = await fetch(`${host}/v1/chat/completions`, {
     method: "POST",
@@ -80,7 +94,7 @@ export async function summarizeConversationWithOllama(
       temperature: 0.2,
       messages: [
         { role: "system", content: system },
-        { role: "user", content: `Please summarize this conversation:\n\n${conversationText}` },
+        { role: "user", content: userPrompt },
       ],
       stream: false,
     }),
