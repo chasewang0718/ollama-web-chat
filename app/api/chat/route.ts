@@ -1,28 +1,54 @@
-import { convertToModelMessages, streamText, UIMessage } from 'ai';
-import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
+import { convertToModelMessages, streamText, UIMessage } from "ai";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 
-import { getLastUserText } from '@/lib/memory/messages';
+import {
+  countUserTurns,
+  formatRecentConversation,
+  getLastUserText,
+} from "@/lib/memory/messages";
 import {
   buildMemorySystemPrompt,
   persistConversationMemory,
-} from '@/lib/memory/rag';
+  runMemoryHealthCheck,
+} from "@/lib/memory/rag";
+import {
+  getLatestSummary,
+  persistSummary,
+  shouldRefreshSummary,
+  summarizeConversationWithOllama,
+} from "@/lib/memory/summary";
 import {
   createServiceRoleClient,
   getMemoryOrgId,
   isMemoryStorageConfigured,
-} from '@/lib/supabase/service';
+} from "@/lib/supabase/service";
 
-const modelName = process.env.OLLAMA_MODEL || 'gemma2:9b';
+const modelName = process.env.OLLAMA_MODEL || "gemma2:9b";
 
 const ollama = createOpenAICompatible({
-  name: 'ollama',
-  baseURL: 'http://127.0.0.1:11434/v1',
-  apiKey: 'ollama',
+  name: "ollama",
+  baseURL: "http://127.0.0.1:11434/v1",
+  apiKey: "ollama",
 });
 
 function isMemoryFeatureEnabled(): boolean {
-  if (process.env.MEMORY_ENABLED === 'false') return false;
+  if (process.env.MEMORY_ENABLED === "false") return false;
   return isMemoryStorageConfigured();
+}
+
+function buildCombinedSystemPrompt(l2Summary?: string, l3Memory?: string): string | undefined {
+  const sections: string[] = [];
+
+  if (l2Summary?.trim()) {
+    sections.push(["[L2 Session Summary]", l2Summary.trim()].join("\n"));
+  }
+
+  if (l3Memory?.trim()) {
+    sections.push(["[L3 Retrieved Memories]", l3Memory.trim()].join("\n"));
+  }
+
+  if (!sections.length) return undefined;
+  return sections.join("\n\n");
 }
 
 export async function POST(req: Request) {
@@ -35,48 +61,70 @@ export async function POST(req: Request) {
     const memoryUserId = process.env.MEMORY_USER_ID;
     const memoryOrgId = getMemoryOrgId();
     const lastUserText = getLastUserText(messages);
+    const userTurns = countUserTurns(messages);
 
-    let systemPrompt: string | undefined;
+    let l2SummaryText: string | undefined;
+    let l3MemoryPrompt: string | undefined;
+
+    if (memoryOn && supabase && memoryUserId) {
+      const latestSummary = await getLatestSummary(supabase, memoryUserId, memoryOrgId);
+      l2SummaryText = latestSummary?.summary;
+    }
+
     if (memoryOn && supabase && memoryUserId && lastUserText) {
-      systemPrompt = await buildMemorySystemPrompt(
+      l3MemoryPrompt = await buildMemorySystemPrompt(
         supabase,
         memoryUserId,
         memoryOrgId,
         lastUserText,
-        Number.parseInt(process.env.MEMORY_MATCH_COUNT || '5', 10) || 5,
+        Number.parseInt(process.env.MEMORY_MATCH_COUNT || "5", 10) || 5,
       );
     }
 
     const baseMessages = await convertToModelMessages(messages);
+    const systemPrompt = buildCombinedSystemPrompt(l2SummaryText, l3MemoryPrompt);
 
     const result = await streamText({
       model: ollama.chatModel(activeModel),
-      ...(systemPrompt
-        ? {
-            system: systemPrompt,
-          }
-        : {}),
+      ...(systemPrompt ? { system: systemPrompt } : {}),
       messages: baseMessages,
       onFinish: async ({ text }) => {
         if (!memoryOn || !supabase || !memoryUserId || !lastUserText || !text?.trim()) {
           return;
         }
-        await persistConversationMemory(
-          supabase,
-          memoryUserId,
-          memoryOrgId,
-          lastUserText,
-          text,
+
+        await persistConversationMemory(supabase, memoryUserId, memoryOrgId, lastUserText, text);
+
+        const healthInterval =
+          Number.parseInt(process.env.MEMORY_HEALTHCHECK_INTERVAL || "20", 10) || 20;
+        if (userTurns > 0 && userTurns % healthInterval === 0) {
+          await runMemoryHealthCheck(supabase, memoryUserId, memoryOrgId);
+        }
+
+        const interval = Number.parseInt(process.env.MEMORY_SUMMARY_INTERVAL || "8", 10) || 8;
+        if (!shouldRefreshSummary(userTurns, interval)) {
+          return;
+        }
+
+        const recentConversation = formatRecentConversation(messages, 14);
+        if (!recentConversation.trim()) return;
+
+        const generatedSummary = await summarizeConversationWithOllama(
+          recentConversation,
+          activeModel,
         );
+        if (!generatedSummary) return;
+
+        await persistSummary(supabase, memoryUserId, memoryOrgId, generatedSummary, userTurns);
       },
     });
 
     return result.toUIMessageStreamResponse();
   } catch (error) {
-    console.error('chat route error:', error);
+    console.error("chat route error:", error);
     return Response.json(
       {
-        error: '聊天请求失败，请确认 Ollama 服务和模型可用。',
+        error: "聊天请求失败，请确认 Ollama 服务和模型可用。",
       },
       { status: 500 },
     );
