@@ -13,6 +13,12 @@ type ConversationItem = {
   created_at: string;
 };
 
+type ConversationContextMenuState = {
+  conversationId: string;
+  x: number;
+  y: number;
+} | null;
+
 export default function Chat() {
   const { messages, setMessages, sendMessage, regenerate, stop, status, error, clearError } = useChat({
     transport: new DefaultChatTransport({ api: '/api/chat' }),
@@ -28,6 +34,7 @@ export default function Chat() {
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [keepWarmEnabled, setKeepWarmEnabled] = useState(true);
   const lastActivityAtRef = useRef(Date.now());
+  const [contextMenu, setContextMenu] = useState<ConversationContextMenuState>(null);
   const isBusy = status === 'submitted' || status === 'streaming';
 
   useEffect(() => {
@@ -153,6 +160,64 @@ export default function Chat() {
     lastActivityAtRef.current = Date.now();
   };
 
+  const createBlankConversation = async (): Promise<string | undefined> => {
+    const created = await fetch('/api/conversations', { method: 'POST' });
+    const createdData = (await created.json()) as {
+      conversation?: { id: string; title: string };
+      error?: string;
+    };
+    if (!created.ok || !createdData.conversation?.id) return undefined;
+
+    const now = new Date().toISOString();
+    const conversation = {
+      id: createdData.conversation.id,
+      title: createdData.conversation.title || '新对话',
+      created_at: now,
+      updated_at: now,
+    };
+    setConversations((items) => [conversation, ...items]);
+    return conversation.id;
+  };
+
+  const handleRenameConversation = async (conversationId: string) => {
+    const target = conversations.find((item) => item.id === conversationId);
+    if (!target) return;
+    const renamed = window.prompt('请输入新的对话标题', target.title || '新对话');
+    if (!renamed || !renamed.trim()) return;
+
+    const response = await fetch(`/api/conversations/${conversationId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: renamed.trim() }),
+    });
+    if (!response.ok) return;
+
+    setConversations((items) =>
+      items.map((item) => (item.id === conversationId ? { ...item, title: renamed.trim() } : item)),
+    );
+  };
+
+  const handleDeleteConversation = async (conversationId: string) => {
+    const target = conversations.find((item) => item.id === conversationId);
+    if (!target) return;
+
+    const response = await fetch(`/api/conversations/${conversationId}`, { method: 'DELETE' });
+    if (!response.ok) return;
+
+    const remaining = conversations.filter((item) => item.id !== conversationId);
+    setConversations(remaining);
+
+    if (activeConversationId === conversationId) {
+      if (remaining.length > 0) {
+        setActiveConversationId(remaining[0].id);
+      } else {
+        const newId = await createBlankConversation();
+        setActiveConversationId(newId || '');
+        setMessages([]);
+      }
+    }
+  };
+
   const renderedMessages = useMemo(
     () =>
       messages.map((message) => ({
@@ -232,6 +297,24 @@ export default function Chat() {
     return () => window.clearInterval(timer);
   }, [keepWarmEnabled, selectedModel, isBusy]);
 
+  useEffect(() => {
+    if (!contextMenu) return;
+
+    const close = () => setContextMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+
+    window.addEventListener('click', close);
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('resize', close);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('resize', close);
+    };
+  }, [contextMenu]);
+
   return (
     <div className="flex h-screen overflow-hidden bg-slate-50 text-slate-900">
       <aside className="hidden h-full w-72 flex-col border-r border-slate-200 bg-[#f7f8fa] p-4 md:flex">
@@ -255,6 +338,14 @@ export default function Chat() {
                 key={item.id}
                 type="button"
                 onClick={() => setActiveConversationId(item.id)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  setContextMenu({
+                    conversationId: item.id,
+                    x: event.clientX,
+                    y: event.clientY,
+                  });
+                }}
                 className={`w-full rounded-lg px-3 py-2 text-left text-sm transition ${
                   item.id === activeConversationId
                     ? 'bg-white font-medium text-slate-900 shadow-sm'
@@ -422,6 +513,69 @@ export default function Chat() {
           {error && <p className="text-red-500">连接失败，请确认 Ollama 服务已启动。</p>}
         </div>
       </form>
+
+      {contextMenu && (
+        <div
+          className="fixed z-50 min-w-44 rounded-xl border border-slate-200 bg-white p-1 shadow-xl"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
+            onClick={() => {
+              setActiveConversationId(contextMenu.conversationId);
+              setContextMenu(null);
+            }}
+          >
+            打开对话
+          </button>
+          <button
+            type="button"
+            className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
+            onClick={() => {
+              const target = conversations.find((item) => item.id === contextMenu.conversationId);
+              if (target?.title) {
+                void navigator.clipboard?.writeText(target.title);
+              }
+              setContextMenu(null);
+            }}
+          >
+            复制标题
+          </button>
+          <button
+            type="button"
+            className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
+            onClick={() => {
+              void navigator.clipboard?.writeText(contextMenu.conversationId);
+              setContextMenu(null);
+            }}
+          >
+            复制会话ID
+          </button>
+          <button
+            type="button"
+            className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
+            onClick={() => {
+              void handleRenameConversation(contextMenu.conversationId);
+              setContextMenu(null);
+            }}
+          >
+            重命名
+          </button>
+          <div className="my-1 border-t border-slate-100" />
+          <button
+            type="button"
+            className="block w-full rounded-lg px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50"
+            onClick={() => {
+              void handleDeleteConversation(contextMenu.conversationId);
+              setContextMenu(null);
+            }}
+          >
+            删除该对话
+          </button>
+        </div>
+      )}
     </div>
   );
 }

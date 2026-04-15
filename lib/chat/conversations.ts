@@ -195,4 +195,48 @@ export async function saveConversationState(
   }
 }
 
+export async function renameConversation(
+  supabase: SupabaseClient,
+  userId: string,
+  orgId: string,
+  conversationId: string,
+  title: string,
+): Promise<boolean> {
+  const nextTitle = title.trim();
+  if (!nextTitle) return false;
+
+  const { error } = await supabase
+    .from("chat_conversations")
+    .update({ title: nextTitle })
+    .eq("id", conversationId)
+    .eq("user_id", userId)
+    .eq("org_id", orgId);
+
+  if (error) {
+    console.warn("rename conversation failed", error.message);
+    return false;
+  }
+  return true;
+}
+
+export async function deleteConversation(
+  supabase: SupabaseClient,
+  userId: string,
+  orgId: string,
+  conversationId: string,
+): Promise<boolean> {
+  const { error } = await supabase
+    .from("chat_conversations")
+    .delete()
+    .eq("id", conversationId)
+    .eq("user_id", userId)
+    .eq("org_id", orgId);
+
+  if (error) {
+    console.warn("delete conversation failed", error.message);
+    return false;
+  }
+  return true;
+}
+
 export type { ConversationRow };
