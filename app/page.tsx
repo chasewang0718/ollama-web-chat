@@ -19,6 +19,13 @@ type ConversationContextMenuState = {
   x: number;
   y: number;
 } | null;
+type ConversationActionItem = {
+  key: string;
+  label: string;
+  danger?: boolean;
+  hidden?: boolean;
+  run: () => void | Promise<void>;
+};
 
 export default function Chat() {
   const { messages, setMessages, sendMessage, regenerate, stop, status, error, clearError } = useChat({
@@ -33,14 +40,32 @@ export default function Chat() {
   const [activeConversationId, setActiveConversationId] = useState<string>('');
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
-  const [keepWarmEnabled, setKeepWarmEnabled] = useState(true);
+  const [keepWarmEnabled, setKeepWarmEnabled] = useState(false);
   const lastActivityAtRef = useRef(Date.now());
+  const messagesLoadSeqRef = useRef(0);
   const [contextMenu, setContextMenu] = useState<ConversationContextMenuState>(null);
   const [storageMode, setStorageMode] = useState<'cloud' | 'local' | 'hybrid' | null>(null);
   const [preferredCreateBackend, setPreferredCreateBackend] = useState<'cloud' | 'local'>('cloud');
   const [editingUserMessageId, setEditingUserMessageId] = useState<string | null>(null);
   const [editingUserMessageDraft, setEditingUserMessageDraft] = useState('');
+  const [showMobileHistory, setShowMobileHistory] = useState(false);
+  const [mobileActionsConversationId, setMobileActionsConversationId] = useState<string | null>(null);
   const isBusy = status === 'submitted' || status === 'streaming';
+
+  const handleSelectModel = async (nextModel: string) => {
+    if (!nextModel || nextModel === selectedModel) return;
+    const previousModel = selectedModel;
+    setSelectedModel(nextModel);
+    try {
+      await fetch('/api/models/unload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: previousModel }),
+      });
+    } catch {
+      // best-effort unload; keep UI responsive even if unload fails
+    }
+  };
 
   const getBackendLabel = (backend: ConversationItem['storage_backend']) => {
     if (backend === 'local') return '本地';
@@ -152,12 +177,16 @@ export default function Chat() {
   }, [setMessages]);
 
   useEffect(() => {
+    if (!activeConversationId) return;
+    const controller = new AbortController();
+
     const loadMessages = async () => {
-      if (!activeConversationId) return;
+      const loadSeq = ++messagesLoadSeqRef.current;
       setIsLoadingMessages(true);
       try {
         const response = await fetch(`/api/conversations/${activeConversationId}/messages`, {
           cache: 'no-store',
+          signal: controller.signal,
         });
         const raw = await response.text();
         const data = (() => {
@@ -169,6 +198,7 @@ export default function Chat() {
           }
         })();
 
+        if (messagesLoadSeqRef.current !== loadSeq) return;
         if (!response.ok) {
           setMessages([]);
           setConversationsError('读取会话消息失败，请稍后重试。');
@@ -176,15 +206,19 @@ export default function Chat() {
         }
 
         setMessages((data.messages || []) as typeof messages);
-      } catch {
+      } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') return;
+        if (messagesLoadSeqRef.current !== loadSeq) return;
         setMessages([]);
         setConversationsError('读取会话消息失败，请稍后重试。');
       } finally {
+        if (messagesLoadSeqRef.current !== loadSeq) return;
         setIsLoadingMessages(false);
       }
     };
 
     void loadMessages();
+    return () => controller.abort();
   }, [activeConversationId, setMessages]);
 
   useEffect(() => {
@@ -346,6 +380,92 @@ export default function Chat() {
     ? conversations.find((item) => item.id === contextMenu.conversationId)
     : undefined;
   const migrationTarget = contextConversation?.storage_backend === 'local' ? 'cloud' : 'local';
+  const mobileActionConversation = mobileActionsConversationId
+    ? conversations.find((item) => item.id === mobileActionsConversationId)
+    : undefined;
+  const mobileMigrationTarget = mobileActionConversation?.storage_backend === 'local' ? 'cloud' : 'local';
+  const buildConversationActions = (
+    conversationId: string,
+    options: {
+      includeOpen?: boolean;
+      migrationTarget: 'cloud' | 'local';
+      conversationTitle?: string;
+      hasStorageBackend?: boolean;
+      onDone: () => void;
+    },
+  ): ConversationActionItem[] => [
+    {
+      key: 'open',
+      label: '打开对话',
+      hidden: !options.includeOpen,
+      run: () => {
+        setActiveConversationId(conversationId);
+        options.onDone();
+      },
+    },
+    {
+      key: 'copy-title',
+      label: '复制标题',
+      run: () => {
+        if (options.conversationTitle) {
+          void navigator.clipboard?.writeText(options.conversationTitle);
+        }
+        options.onDone();
+      },
+    },
+    {
+      key: 'copy-id',
+      label: '复制会话ID',
+      run: () => {
+        void navigator.clipboard?.writeText(conversationId);
+        options.onDone();
+      },
+    },
+    {
+      key: 'rename',
+      label: '重命名',
+      run: () => {
+        void handleRenameConversation(conversationId);
+        options.onDone();
+      },
+    },
+    {
+      key: 'migrate',
+      label: `迁移到${options.migrationTarget === 'cloud' ? '云端' : '本地'}`,
+      hidden: !options.hasStorageBackend,
+      run: () => {
+        void handleMigrateConversation(conversationId, options.migrationTarget);
+        options.onDone();
+      },
+    },
+    {
+      key: 'delete',
+      label: '删除该对话',
+      danger: true,
+      run: () => {
+        void handleDeleteConversation(conversationId);
+        options.onDone();
+      },
+    },
+  ];
+  const desktopConversationActions = contextMenu
+    ? buildConversationActions(contextMenu.conversationId, {
+        includeOpen: true,
+        migrationTarget,
+        conversationTitle: contextConversation?.title,
+        hasStorageBackend: Boolean(contextConversation?.storage_backend),
+        onDone: () => setContextMenu(null),
+      })
+    : [];
+  const mobileConversationActions = mobileActionsConversationId
+    ? buildConversationActions(mobileActionsConversationId, {
+        includeOpen: false,
+        migrationTarget: mobileMigrationTarget,
+        conversationTitle: mobileActionConversation?.title,
+        hasStorageBackend: Boolean(mobileActionConversation?.storage_backend),
+        onDone: () => setMobileActionsConversationId(null),
+      })
+    : [];
 
   const resolveRedoTextByMessageIndex = (index: number): string | undefined => {
     const current = renderedMessages[index];
@@ -394,17 +514,26 @@ export default function Chat() {
 
   const handleApplyEditedUserMessage = async () => {
     if (!editingUserMessageId || !activeConversationId || isBusy) return;
+    const editId = editingUserMessageId;
     const value = editingUserMessageDraft.trim();
     if (!value) return;
 
-    const targetIndex = messages.findIndex((item) => item.id === editingUserMessageId && item.role === 'user');
-    if (targetIndex < 0) {
+    let found = false;
+    // Use functional update to avoid stale-closure overwrite when stream updates overlap with editing.
+    setMessages((current) => {
+      const targetIndex = current.findIndex((item) => item.id === editId && item.role === 'user');
+      if (targetIndex < 0) {
+        return current;
+      }
+      found = true;
+      return current.slice(0, targetIndex);
+    });
+    if (!found) {
       handleCancelEditUserMessage();
       return;
     }
 
     // Re-input behavior: trim conversation from edited turn and re-run from the updated user text.
-    setMessages(messages.slice(0, targetIndex));
     handleCancelEditUserMessage();
     if (error) clearError();
     lastActivityAtRef.current = Date.now();
@@ -480,6 +609,7 @@ export default function Chat() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ model: selectedModel }),
+          signal: AbortSignal.timeout(6000),
         });
       } catch {
         // best-effort keep-warm; ignore transient errors
@@ -661,6 +791,15 @@ export default function Chat() {
           <div className="mx-auto flex w-full max-w-3xl flex-col pb-8">
           <header className="mb-6">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2 md:hidden">
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700"
+                  onClick={() => setShowMobileHistory((v) => !v)}
+                >
+                  {showMobileHistory ? '收起会话' : '会话列表'}
+                </button>
+              </div>
               {storageMode === 'hybrid' ? (
                 <div className="flex flex-wrap gap-1.5">
                   <button
@@ -706,6 +845,50 @@ export default function Chat() {
               )}
               <span className="text-xs text-slate-400">{conversations.length} 个会话</span>
             </div>
+            {showMobileHistory && (
+              <div className="mb-4 rounded-xl border border-slate-200 bg-white p-2 md:hidden">
+                <div className="max-h-52 space-y-1 overflow-y-auto">
+                  {isLoadingConversations && <p className="px-2 py-1 text-xs text-slate-400">加载中...</p>}
+                  {!isLoadingConversations &&
+                    conversations.map((item) => (
+                      <div
+                        key={item.id}
+                        className={`flex items-center gap-1 rounded-lg px-2 py-1 ${
+                          item.id === activeConversationId ? 'bg-slate-100' : ''
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          className="min-w-0 flex-1 text-left"
+                          onClick={() => {
+                            setActiveConversationId(item.id);
+                            setShowMobileHistory(false);
+                          }}
+                        >
+                          <p className="truncate text-sm text-slate-800">{item.title || '新对话'}</p>
+                          <p className="text-[11px] text-slate-400">{new Date(item.updated_at).toLocaleString()}</p>
+                        </button>
+                        <button
+                          type="button"
+                          className="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100"
+                          title="会话操作"
+                          aria-label="会话操作"
+                          onClick={() => setMobileActionsConversationId(item.id)}
+                        >
+                          <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true">
+                            <circle cx="12" cy="5" r="1.8" fill="currentColor" />
+                            <circle cx="12" cy="12" r="1.8" fill="currentColor" />
+                            <circle cx="12" cy="19" r="1.8" fill="currentColor" />
+                          </svg>
+                        </button>
+                      </div>
+                    ))}
+                  {!isLoadingConversations && conversations.length === 0 && (
+                    <p className="px-2 py-1 text-xs text-slate-400">暂无历史对话</p>
+                  )}
+                </div>
+              </div>
+            )}
             <p className="text-sm font-medium text-slate-500">本地 AI 助手（Ollama）</p>
             {renderedMessages.length === 0 && (
               <h1 className="mt-1 text-3xl font-semibold tracking-tight text-slate-800">今天想让我帮你做什么？</h1>
@@ -909,7 +1092,9 @@ export default function Chat() {
                   <select
                     id="model-select"
                     value={selectedModel}
-                    onChange={(event) => setSelectedModel(event.target.value)}
+                    onChange={(event) => {
+                      void handleSelectModel(event.target.value);
+                    }}
                     className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700"
                     disabled={isBusy || models.length === 0}
                   >
@@ -975,72 +1160,66 @@ export default function Chat() {
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onClick={(event) => event.stopPropagation()}
         >
-          <button
-            type="button"
-            className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
-            onClick={() => {
-              setActiveConversationId(contextMenu.conversationId);
-              setContextMenu(null);
-            }}
-          >
-            打开对话
-          </button>
-          <button
-            type="button"
-            className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
-            onClick={() => {
-              const target = conversations.find((item) => item.id === contextMenu.conversationId);
-              if (target?.title) {
-                void navigator.clipboard?.writeText(target.title);
-              }
-              setContextMenu(null);
-            }}
-          >
-            复制标题
-          </button>
-          <button
-            type="button"
-            className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
-            onClick={() => {
-              void navigator.clipboard?.writeText(contextMenu.conversationId);
-              setContextMenu(null);
-            }}
-          >
-            复制会话ID
-          </button>
-          <button
-            type="button"
-            className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
-            onClick={() => {
-              void handleRenameConversation(contextMenu.conversationId);
-              setContextMenu(null);
-            }}
-          >
-            重命名
-          </button>
-          {contextConversation?.storage_backend && (
-            <button
-              type="button"
-              className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
-              onClick={() => {
-                void handleMigrateConversation(contextMenu.conversationId, migrationTarget);
-                setContextMenu(null);
-              }}
-            >
-              迁移到{migrationTarget === 'cloud' ? '云端' : '本地'}
-            </button>
-          )}
+          {desktopConversationActions
+            .filter((action) => !action.hidden && !action.danger)
+            .map((action) => (
+              <button
+                key={action.key}
+                type="button"
+                className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
+                onClick={() => action.run()}
+              >
+                {action.label}
+              </button>
+            ))}
           <div className="my-1 border-t border-slate-100" />
-          <button
-            type="button"
-            className="block w-full rounded-lg px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50"
-            onClick={() => {
-              void handleDeleteConversation(contextMenu.conversationId);
-              setContextMenu(null);
-            }}
+          {desktopConversationActions
+            .filter((action) => !action.hidden && action.danger)
+            .map((action) => (
+              <button
+                key={action.key}
+                type="button"
+                className="block w-full rounded-lg px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50"
+                onClick={() => action.run()}
+              >
+                {action.label}
+              </button>
+            ))}
+        </div>
+      )}
+      {mobileActionsConversationId && (
+        <div className="fixed inset-0 z-50 bg-slate-900/25 md:hidden" onClick={() => setMobileActionsConversationId(null)}>
+          <div
+            className="absolute inset-x-0 bottom-0 rounded-t-2xl bg-white p-3 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
           >
-            删除该对话
-          </button>
+            <p className="mb-2 px-2 text-xs text-slate-500">会话操作</p>
+            {mobileConversationActions
+              .filter((action) => !action.hidden && !action.danger)
+              .map((action) => (
+                <button
+                  key={action.key}
+                  type="button"
+                  className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
+                  onClick={() => action.run()}
+                >
+                  {action.label}
+                </button>
+              ))}
+            <div className="my-1 border-t border-slate-100" />
+            {mobileConversationActions
+              .filter((action) => !action.hidden && action.danger)
+              .map((action) => (
+                <button
+                  key={action.key}
+                  type="button"
+                  className="block w-full rounded-lg px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50"
+                  onClick={() => action.run()}
+                >
+                  {action.label}
+                </button>
+              ))}
+          </div>
         </div>
       )}
     </div>

@@ -31,8 +31,13 @@ function isMemoryFeatureEnabled(): boolean {
 
 type ReplyLanguage = "same" | "zh" | "en" | "nl" | "ja";
 type ResponseMode = "strict-task" | "creative-continue";
-type StrictTaskType = "summarize" | "extract" | "analyze" | "qa" | "generic";
+type StrictTaskType = "polish" | "summarize" | "extract" | "analyze" | "qa" | "generic";
 type PromptProfile = "default" | "cydonia";
+type RoutedTask = {
+  taskType: StrictTaskType;
+  responseMode: ResponseMode;
+  confidence: number;
+};
 
 function isCydoniaModel(model: string): boolean {
   return /^cydonia/i.test(model.trim());
@@ -61,30 +66,81 @@ function detectInputLanguage(text: string | undefined): ReplyLanguage {
   return "same";
 }
 
-function detectResponseMode(text: string | undefined): ResponseMode {
-  if (!text) return "strict-task";
+function routeTask(text: string | undefined): RoutedTask {
+  if (!text) return { taskType: "generic", responseMode: "strict-task", confidence: 0.3 };
   const t = text.toLowerCase();
+
+  // Pipeline 1: editing / polishing
   if (
-    /续写|接着写|继续写|写下一段|写后续|扩写|润色|改写|重写|仿写|优化文案|美化表达|调整语气/.test(
-      t,
-    ) ||
-    /continue writing|continue the story|story continuation|write the next|expand|elaborate|polish|rewrite|rephrase|paraphrase|copyedit/.test(
-      t,
-    )
+    /润色|改写|重写|仿写|优化文案|美化表达|调整语气|改得更顺|改成/.test(t) ||
+    /\b(polish|rewrite|rephrase|paraphrase|copyedit|improve wording)\b/.test(t)
   ) {
-    return "creative-continue";
+    return { taskType: "polish", responseMode: "strict-task", confidence: 0.93 };
   }
-  return "strict-task";
+
+  // Pipeline 2: creative continuation
+  if (
+    /续写|接着写|继续写|写下一段|写后续|扩写/.test(t) ||
+    /\b(continue writing|continue the story|story continuation|write the next|expand|elaborate)\b/.test(t)
+  ) {
+    return { taskType: "generic", responseMode: "creative-continue", confidence: 0.9 };
+  }
+
+  // Pipeline 3-6: structured task buckets
+  if (/总结|摘要|概括|总结一下|核心观点|\b(summary|summarize)\b/.test(t)) {
+    return { taskType: "summarize", responseMode: "strict-task", confidence: 0.9 };
+  }
+  if (/提取|抽取|信息抽取|要点提取|\b(extract|list out|identify)\b/.test(t)) {
+    return { taskType: "extract", responseMode: "strict-task", confidence: 0.9 };
+  }
+  if (/分析|问题|建议|漏洞|评估|\b(analyze|analysis|review)\b/.test(t)) {
+    return { taskType: "analyze", responseMode: "strict-task", confidence: 0.86 };
+  }
+  if (/回答|问答|解答|\b(question|answer)\b/.test(t)) {
+    return { taskType: "qa", responseMode: "strict-task", confidence: 0.82 };
+  }
+  return { taskType: "generic", responseMode: "strict-task", confidence: 0.6 };
 }
 
-function detectStrictTaskType(text: string | undefined): StrictTaskType {
-  if (!text) return "generic";
-  const t = text.toLowerCase();
-  if (/总结|摘要|概括|总结一下|核心观点|summary|summarize/.test(t)) return "summarize";
-  if (/提取|抽取|信息抽取|要点提取|extract|list out|identify/.test(t)) return "extract";
-  if (/分析|问题|建议|漏洞|评估|analyze|analysis|review/.test(t)) return "analyze";
-  if (/回答|问答|解答|question|answer/.test(t)) return "qa";
-  return "generic";
+function getGenerationProfile(
+  taskType: StrictTaskType,
+  responseMode: ResponseMode,
+  cydoniaModel: boolean,
+  longInput: boolean,
+): { temperature: number; topP: number; maxOutputTokens?: number } {
+  if (responseMode === "creative-continue") {
+    return {
+      temperature: cydoniaModel ? 0.55 : 0.75,
+      topP: cydoniaModel ? 0.82 : 0.92,
+      maxOutputTokens: cydoniaModel ? (longInput ? 800 : 1100) : undefined,
+    };
+  }
+
+  const strictBase = (() => {
+    switch (taskType) {
+      case "polish":
+        return { temperature: 0.22, topP: 0.8 };
+      case "extract":
+        return { temperature: 0.1, topP: 0.65 };
+      case "summarize":
+        return { temperature: 0.18, topP: 0.72 };
+      case "analyze":
+        return { temperature: 0.25, topP: 0.78 };
+      case "qa":
+        return { temperature: 0.2, topP: 0.75 };
+      default:
+        return { temperature: 0.2, topP: 0.75 };
+    }
+  })();
+
+  if (cydoniaModel) {
+    return {
+      temperature: Math.min(strictBase.temperature, 0.2),
+      topP: Math.min(strictBase.topP, 0.7),
+      maxOutputTokens: longInput ? 800 : 1100,
+    };
+  }
+  return strictBase;
 }
 
 function buildCombinedSystemPrompt(
@@ -93,6 +149,7 @@ function buildCombinedSystemPrompt(
   preferredLanguage: ReplyLanguage = "same",
   responseMode: ResponseMode = "strict-task",
   strictTaskType: StrictTaskType = "generic",
+  taskRoutingConfidence?: number,
   options?: { relaxedForLongInput?: boolean; promptProfile?: PromptProfile },
 ): string | undefined {
   const sections: string[] = [];
@@ -109,6 +166,9 @@ function buildCombinedSystemPrompt(
   };
   const behaviorPrompt = languagePolicyByPreference[preferredLanguage];
   sections.push(`[Response Policy]\n${behaviorPrompt}`);
+  if (typeof taskRoutingConfidence === "number") {
+    sections.push(`[Task Routing]\nRouted task: ${strictTaskType}; confidence: ${taskRoutingConfidence.toFixed(2)}`);
+  }
   if (bypassTaskConstraints) {
     // Cydonia profile: remove task/format constraints entirely and let the model follow user prompt natively.
   } else if (relaxedForLongInput) {
@@ -122,6 +182,8 @@ function buildCombinedSystemPrompt(
     );
   } else if (responseMode === "strict-task") {
     const strictOutputFormat: Record<StrictTaskType, string> = {
+      polish:
+        "Output format:\n1) 第一行必须是：你的需求是：<一句话任务复述>\n2) 直接给出润色后的结果\n3) 不要添加解释性前言，除非用户要求",
       summarize:
         "Output format:\n1) 第一行必须是：你的需求是：<一句话任务复述>\n2) 核心观点（3条项目符号）\n3) 可选：一句结论",
       extract:
@@ -163,6 +225,13 @@ function buildCombinedSystemPrompt(
   }
 
   if (l3Memory?.trim()) {
+    sections.push(
+      [
+        "[Memory Citation Rule]",
+        "When using facts from L3 Retrieved Memories, append citation tags like [M1] at sentence end.",
+        "Do not fabricate citation tags that are not present in L3 snippets.",
+      ].join("\n"),
+    );
     sections.push(["[L3 Retrieved Memories]", l3Memory.trim()].join("\n"));
   }
 
@@ -232,8 +301,9 @@ export async function POST(req: Request) {
     const userTurns = countUserTurns(messages);
     const preferredLanguage: ReplyLanguage =
       detectExplicitReplyLanguage(lastUserText) || detectInputLanguage(lastUserText);
-    const responseMode = detectResponseMode(lastUserText);
-    const strictTaskType = detectStrictTaskType(lastUserText);
+    const routedTask = routeTask(lastUserText);
+    const responseMode = routedTask.responseMode;
+    const strictTaskType = routedTask.taskType;
     const longInput = (lastUserText?.length || 0) >= CYDONIA_LONG_INPUT_THRESHOLD;
     const cydoniaModel = isCydoniaModel(activeModel);
     const relaxConstraintsForLongInput = cydoniaModel && longInput;
@@ -268,28 +338,18 @@ export async function POST(req: Request) {
       preferredLanguage,
       responseMode,
       strictTaskType,
+      routedTask.confidence,
       { relaxedForLongInput: relaxConstraintsForLongInput, promptProfile },
     );
+    const generationProfile = getGenerationProfile(strictTaskType, responseMode, cydoniaModel, longInput);
 
     const result = await streamText({
       model: ollama.chatModel(activeModel),
-      temperature:
-        responseMode === "creative-continue"
-          ? cydoniaModel
-            ? 0.55
-            : 0.75
-          : cydoniaModel
-            ? 0.15
-            : 0.2,
-      topP:
-        responseMode === "creative-continue"
-          ? cydoniaModel
-            ? 0.82
-            : 0.92
-          : cydoniaModel
-            ? 0.68
-            : 0.75,
-      ...(cydoniaModel ? { maxOutputTokens: longInput ? 800 : 1100 } : {}),
+      temperature: generationProfile.temperature,
+      topP: generationProfile.topP,
+      ...(typeof generationProfile.maxOutputTokens === "number"
+        ? { maxOutputTokens: generationProfile.maxOutputTokens }
+        : {}),
       ...(systemPrompt ? { system: systemPrompt } : {}),
       messages: baseMessages,
       onFinish: async ({ text }) => {

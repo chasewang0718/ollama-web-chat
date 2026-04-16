@@ -330,8 +330,28 @@ export async function migrateConversationBetweenBackends(
     await setConversationMigrationStatus(controlPlane, userId, orgId, conversationId, "running");
   }
 
+  // Preflight: source conversation must exist before any copy step.
+  const sourceConversation = await fetchConversation(sourceClient, userId, orgId, conversationId);
+  if (!sourceConversation) {
+    if (!dryRun) {
+      await setConversationMigrationStatus(controlPlane, userId, orgId, conversationId, "failed");
+    }
+    return {
+      ok: false,
+      sourceBackend: effectiveSource,
+      targetBackend: effectiveTarget,
+      migrated: { conversations: 0, memories: 0, memoryVersions: 0 },
+      error: "source conversation not found",
+      rollbackApplied: options.rollback || undefined,
+    };
+  }
+
+  let migratedConversations = 0;
+  let migratedMemories = 0;
+  let migratedVersions = 0;
+  let bindingSwitched = false;
   try {
-    const conversations = await copyConversation(
+    migratedConversations = await copyConversation(
       sourceClient,
       targetClient,
       userId,
@@ -347,7 +367,8 @@ export async function migrateConversationBetweenBackends(
       conversationId,
       dryRun,
     );
-    const memoryVersions = await replaceMemoryVersions(
+    migratedMemories = memResult.count;
+    migratedVersions = await replaceMemoryVersions(
       sourceClient,
       targetClient,
       userId,
@@ -356,8 +377,15 @@ export async function migrateConversationBetweenBackends(
       dryRun,
     );
 
+    // Post-copy verification: target conversation must be readable before binding switch.
+    const targetConversation = await fetchConversation(targetClient, userId, orgId, conversationId);
+    if (!targetConversation) {
+      throw new Error("post-copy verification failed: target conversation missing");
+    }
+
     if (!dryRun) {
       await bindConversationBackend(controlPlane, userId, orgId, conversationId, effectiveTarget);
+      bindingSwitched = true;
     }
     if (!dryRun) {
       await setConversationMigrationStatus(controlPlane, userId, orgId, conversationId, "done");
@@ -368,13 +396,24 @@ export async function migrateConversationBetweenBackends(
       sourceBackend: effectiveSource,
       targetBackend: effectiveTarget,
       migrated: {
-        conversations,
-        memories: memResult.count,
-        memoryVersions,
+        conversations: migratedConversations,
+        memories: migratedMemories,
+        memoryVersions: migratedVersions,
       },
       rollbackApplied: options.rollback || undefined,
     };
   } catch (error) {
+    let finalError = error instanceof Error ? error.message : String(error);
+    const revertBindingOnFailure = process.env.STORAGE_MIGRATION_REVERT_BINDING_ON_FAILURE !== "false";
+    if (!dryRun && bindingSwitched && revertBindingOnFailure) {
+      try {
+        await bindConversationBackend(controlPlane, userId, orgId, conversationId, effectiveSource);
+      } catch (revertError) {
+        finalError = `${finalError}; binding revert failed: ${
+          revertError instanceof Error ? revertError.message : String(revertError)
+        }`;
+      }
+    }
     if (!dryRun) {
       await setConversationMigrationStatus(controlPlane, userId, orgId, conversationId, "failed");
     }
@@ -382,8 +421,12 @@ export async function migrateConversationBetweenBackends(
       ok: false,
       sourceBackend: effectiveSource,
       targetBackend: effectiveTarget,
-      migrated: { conversations: 0, memories: 0, memoryVersions: 0 },
-      error: error instanceof Error ? error.message : String(error),
+      migrated: {
+        conversations: migratedConversations,
+        memories: migratedMemories,
+        memoryVersions: migratedVersions,
+      },
+      error: finalError,
       rollbackApplied: options.rollback || undefined,
     };
   }

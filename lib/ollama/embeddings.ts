@@ -7,6 +7,7 @@ const DEFAULT_HOST = "http://127.0.0.1:11434";
 const DEFAULT_MODEL = "nomic-embed-text";
 /** 须与 Supabase `memories.embedding vector(N)` 的 N 一致；nomic-embed-text 为 768 */
 const DEFAULT_DIM = 768;
+const DEFAULT_EMBED_TIMEOUT_MS = 12_000;
 
 export function getExpectedEmbeddingDimensions(): number {
   const raw = process.env.EMBEDDING_DIMENSIONS;
@@ -18,11 +19,13 @@ export function getExpectedEmbeddingDimensions(): number {
 export async function embedText(text: string): Promise<number[]> {
   const host = (process.env.OLLAMA_HOST || DEFAULT_HOST).replace(/\/$/, "");
   const model = process.env.OLLAMA_EMBED_MODEL || DEFAULT_MODEL;
+  const timeoutMs = Number.parseInt(process.env.OLLAMA_EMBED_TIMEOUT_MS || "", 10) || DEFAULT_EMBED_TIMEOUT_MS;
 
   const response = await fetch(`${host}/api/embeddings`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model, prompt: text }),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
   if (!response.ok) {

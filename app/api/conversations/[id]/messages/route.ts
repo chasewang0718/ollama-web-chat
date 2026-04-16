@@ -1,4 +1,5 @@
 import { bindConversationBackend, getConversationBackend } from "@/lib/storage/bindings";
+import { ensureBackendReady } from "@/lib/storage/connection";
 import {
   getControlPlaneStorageProvider,
   getStorageMode,
@@ -12,6 +13,13 @@ type Params = { params: Promise<{ id: string }> };
 function isLocalBackendUnavailable(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return error.message.includes("local service role client unavailable");
+}
+
+function resolveBackendCandidates(bound?: "cloud" | "local"): Array<"cloud" | "local"> {
+  if (bound) return [bound, bound === "cloud" ? "local" : "cloud"];
+  if (getStorageMode() === "hybrid") return ["cloud", "local"];
+  const fallback = resolveDefaultBackendForNewConversation(getStorageMode());
+  return fallback === "cloud" ? ["cloud", "local"] : ["local", "cloud"];
 }
 
 export async function GET(_req: Request, { params }: Params) {
@@ -28,52 +36,34 @@ export async function GET(_req: Request, { params }: Params) {
   const backend = bindingClient
     ? await getConversationBackend(bindingClient, userId, orgId, id)
     : undefined;
-  if (backend) {
-    const storage = getStorageProviderForBackend(backend);
-    const messages = await storage.conversation
-      .getMessages(userId, orgId, id)
-      .catch(async (error: unknown) => {
-        if (backend === "local" && isLocalBackendUnavailable(error)) {
-          return getStorageProviderForBackend("cloud").conversation.getMessages(userId, orgId, id);
-        }
-        throw error;
-      });
-    return Response.json({ messages });
-  }
+  const candidates = resolveBackendCandidates(backend);
+  let firstError: unknown = undefined;
 
-  // Legacy compatibility: conversations created before binding rollout.
-  // In hybrid mode, probe both backends and backfill binding once a hit is found.
-  if (getStorageMode() === "hybrid") {
-    const cloudStorage = getStorageProviderForBackend("cloud");
-    const cloudMessages = await cloudStorage.conversation.getMessages(userId, orgId, id);
-    if (cloudMessages.length > 0) {
-      if (bindingClient) {
-        await bindConversationBackend(bindingClient, userId, orgId, id, "cloud");
-      }
-      return Response.json({ messages: cloudMessages });
+  for (const selectedBackend of candidates) {
+    const ready = await ensureBackendReady(selectedBackend);
+    if (!ready.ok) {
+      continue;
     }
-
-    const localStorage = getStorageProviderForBackend("local");
-    const localMessages = await localStorage.conversation
-      .getMessages(userId, orgId, id)
-      .catch(() => [] as Awaited<ReturnType<typeof localStorage.conversation.getMessages>>);
-    if (localMessages.length > 0) {
-      if (bindingClient) {
-        await bindConversationBackend(bindingClient, userId, orgId, id, "local");
+    const storage = getStorageProviderForBackend(selectedBackend);
+    try {
+      const messages = await storage.conversation.getMessages(userId, orgId, id);
+      if (!backend && bindingClient && messages.length > 0) {
+        await bindConversationBackend(bindingClient, userId, orgId, id, selectedBackend);
       }
-      return Response.json({ messages: localMessages });
-    }
-  }
-
-  const selectedBackend = resolveDefaultBackendForNewConversation(getStorageMode());
-  const storage = getStorageProviderForBackend(selectedBackend);
-  const messages = await storage.conversation
-    .getMessages(userId, orgId, id)
-    .catch(async (error: unknown) => {
+      if (messages.length > 0) {
+        return Response.json({ messages });
+      }
+      // Keep probing when no messages are found, because legacy conversations may be on the other backend.
+    } catch (error) {
       if (selectedBackend === "local" && isLocalBackendUnavailable(error)) {
-        return getStorageProviderForBackend("cloud").conversation.getMessages(userId, orgId, id);
+        continue;
       }
-      throw error;
-    });
-  return Response.json({ messages });
+      if (!firstError) firstError = error;
+    }
+  }
+
+  if (firstError) {
+    throw firstError;
+  }
+  return Response.json({ messages: [] });
 }

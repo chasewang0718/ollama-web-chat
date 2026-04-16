@@ -21,6 +21,7 @@ const RULE_HINT_PATTERNS = [
   /(规则|约束|禁止|禁用|必须|不要|固定|风格|语气|目标|代号|主角|设定)/i,
   /\b(rule|constraint|must|forbidden|style|tone|objective|id|setting)\b/i,
 ];
+const MEMORY_SNIPPET_MAX_CHARS = Number.parseInt(process.env.MEMORY_SNIPPET_MAX_CHARS || "320", 10) || 320;
 
 function compactWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -82,9 +83,12 @@ function shouldPersistMemory(userText: string, assistantText: string): boolean {
 function scoreMemoryRow(row: MatchRow): number {
   const plain = compactWhitespace(stripMemoryMeta(row.content));
   const similarity = row.similarity || 0;
-  const importanceBoost = (row.importance || 1) * 0.015;
-  const ruleBoost = RULE_HINT_PATTERNS.some((p) => p.test(plain)) ? 0.08 : 0;
-  const chinesePenalty = isLikelyChinese(plain) ? 0 : 0.02;
+  const importanceWeight = Number.parseFloat(process.env.MEMORY_RERANK_IMPORTANCE_WEIGHT || "0.015") || 0.015;
+  const ruleBoostWeight = Number.parseFloat(process.env.MEMORY_RERANK_RULE_BOOST || "0.08") || 0.08;
+  const languagePenalty = Number.parseFloat(process.env.MEMORY_RERANK_LANGUAGE_PENALTY || "0.02") || 0.02;
+  const importanceBoost = (row.importance || 1) * importanceWeight;
+  const ruleBoost = RULE_HINT_PATTERNS.some((p) => p.test(plain)) ? ruleBoostWeight : 0;
+  const chinesePenalty = isLikelyChinese(plain) ? 0 : languagePenalty;
   return similarity + importanceBoost + ruleBoost - chinesePenalty;
 }
 
@@ -95,6 +99,37 @@ function rerankRows(rows: MatchRow[]): MatchRow[] {
     const sb = scoreMemoryRow(b);
     return sb - sa;
   });
+}
+
+function dedupeMemoryRows(rows: MatchRow[]): MatchRow[] {
+  const seenKeys = new Set<string>();
+  const seenPlain = new Set<string>();
+  const unique: MatchRow[] = [];
+
+  for (const row of rows) {
+    const plain = compactWhitespace(stripMemoryMeta(row.content));
+    if (!plain) continue;
+    const meta = extractMemoryMeta(row.content);
+    const key = meta.key?.trim();
+    if (key && seenKeys.has(key)) continue;
+    if (seenPlain.has(plain)) continue;
+    if (key) seenKeys.add(key);
+    seenPlain.add(plain);
+    unique.push(row);
+  }
+  return unique;
+}
+
+function isLowValueSnippet(text: string): boolean {
+  if (!text) return true;
+  if (text.length < 12) return true;
+  const transient = /^(ok|okay|好的|明白了|收到|谢谢|thanks|understood)[!,. ]*$/i;
+  return transient.test(text);
+}
+
+function clampSnippet(text: string): string {
+  if (text.length <= MEMORY_SNIPPET_MAX_CHARS) return text;
+  return `${text.slice(0, MEMORY_SNIPPET_MAX_CHARS)}...`;
 }
 
 function inferMemoryImportance(userText: string, assistantText: string): number {
@@ -257,11 +292,17 @@ export async function buildMemorySystemPrompt(
   );
   if (rows.length === 0) return undefined;
 
-  const lines = rows
+  const dedupedRows = dedupeMemoryRows(rows);
+  const lines = dedupedRows
     .slice(0, matchCount)
-    .map((r) => `- ${compactWhitespace(stripMemoryMeta(r.content))}`);
+    .map((r) => clampSnippet(compactWhitespace(stripMemoryMeta(r.content))))
+    .filter((snippet) => !isLowValueSnippet(snippet))
+    .slice(0, matchCount)
+    .map((snippet, index) => `[M${index + 1}] ${snippet}`);
+  if (!lines.length) return undefined;
   return [
-    "以下为与用户问题可能相关的长期记忆（仅作参考，不要编造未提供的信息）：",
+    "以下为与用户问题可能相关的长期记忆（仅作参考，不要编造未提供的信息）。",
+    "若答案使用了其中事实，请在对应句末标注来源编号（如 [M1]、[M2]）。",
     ...lines,
   ].join("\n");
 }
