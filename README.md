@@ -88,3 +88,21 @@ npm run dev
 ```
 
 Open: [http://localhost:3000](http://localhost:3000)
+
+## Windows Ollama Supervisor Script
+
+For persistent `Stopping...` states on Windows, you can run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\windows\ollama-heal.ps1
+```
+
+What it does:
+
+- checks `/api/ps` for `Stopping...` models
+- verifies a model via `/api/show`
+- if unhealthy, kills `ollama.exe` / `ollama app.exe`
+- restarts `ollama serve`
+- loops health checks until recovered or timeout
+
+You can wire this script into Task Scheduler for periodic self-heal outside the app process.
