@@ -148,6 +148,13 @@ function isTimeoutLikeError(error: unknown): boolean {
   );
 }
 
+function isBusyLikeError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const maybe = error as { message?: string };
+  const message = maybe.message?.toLowerCase() || "";
+  return message.includes("engine busy") || message.includes("ollama embeddings skipped");
+}
+
 function inferMemoryImportance(userText: string, assistantText: string): number {
   const combined = `${userText}\n${assistantText}`;
   if (RULE_HINT_PATTERNS.some((p) => p.test(combined))) return 4;
@@ -291,6 +298,10 @@ export async function buildMemorySystemPrompt(
   try {
     embedding = await embedText(trimmed);
   } catch (e) {
+    if (isBusyLikeError(e)) {
+      // Chat is holding the Ollama lock; skip RAG rather than contending for GPU/engine.
+      return undefined;
+    }
     if (isTimeoutLikeError(e)) {
       memoryRetrieveCooldownUntil = Date.now() + MEMORY_RETRIEVE_COOLDOWN_MS;
       memoryRetrieveCooldownLoggedAt = Date.now();
@@ -370,6 +381,9 @@ export async function persistConversationMemory(
   try {
     embedding = await embedText(content);
   } catch (e) {
+    if (isBusyLikeError(e)) {
+      return;
+    }
     console.warn("memory persist: embed failed", e);
     return;
   }

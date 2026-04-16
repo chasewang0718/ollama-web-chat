@@ -3,6 +3,7 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 
+import { runOllamaExclusive } from "@/lib/ollama/scheduler";
 import {
   countUserTurns,
   formatRecentConversation,
@@ -539,54 +540,52 @@ export async function POST(req: Request) {
     }
 
     const storage = getStorageProviderForBackend(selectedBackend);
-    const activeModel = model || modelName;
-    let runtimeModel = activeModel;
-    if (isModelQuarantined(runtimeModel) && OLLAMA_AUTO_FALLBACK_ENABLED && OLLAMA_FALLBACK_MODEL) {
-      runtimeModel = OLLAMA_FALLBACK_MODEL;
-      console.warn(`chat route: model ${activeModel} quarantined, fallback to ${runtimeModel}`);
-    }
-    const modelHealth = await ensureModelReady(activeModel);
-    if (!modelHealth.ok) {
-      const canFallback = OLLAMA_AUTO_FALLBACK_ENABLED && OLLAMA_FALLBACK_MODEL && OLLAMA_FALLBACK_MODEL !== activeModel;
-      if (!canFallback) {
-        return Response.json({ error: modelHealth.error }, { status: 503 });
+    return await runOllamaExclusive(async () => {
+      const activeModel = model || modelName;
+      let runtimeModel = activeModel;
+      if (isModelQuarantined(runtimeModel) && OLLAMA_AUTO_FALLBACK_ENABLED && OLLAMA_FALLBACK_MODEL) {
+        runtimeModel = OLLAMA_FALLBACK_MODEL;
+        console.warn(`chat route: model ${activeModel} quarantined, fallback to ${runtimeModel}`);
+      }
+      const modelHealth = await ensureModelReady(activeModel);
+      if (!modelHealth.ok) {
+        const canFallback =
+          OLLAMA_AUTO_FALLBACK_ENABLED && OLLAMA_FALLBACK_MODEL && OLLAMA_FALLBACK_MODEL !== activeModel;
+        if (!canFallback) {
+          return Response.json({ error: modelHealth.error }, { status: 503 });
+        }
+
+        const fallbackHealth = await ensureModelReady(OLLAMA_FALLBACK_MODEL);
+        if (!fallbackHealth.ok) {
+          return Response.json(
+            { error: `${modelHealth.error}；自动回退模型 ${OLLAMA_FALLBACK_MODEL} 也不可用：${fallbackHealth.error}` },
+            { status: 503 },
+          );
+        }
+        runtimeModel = OLLAMA_FALLBACK_MODEL;
+        console.warn(`chat route: model ${activeModel} unavailable, fallback to ${runtimeModel}`);
       }
 
-      const fallbackHealth = await ensureModelReady(OLLAMA_FALLBACK_MODEL);
-      if (!fallbackHealth.ok) {
-        return Response.json(
-          { error: `${modelHealth.error}；自动回退模型 ${OLLAMA_FALLBACK_MODEL} 也不可用：${fallbackHealth.error}` },
-          { status: 503 },
-        );
+      const supabase = storage.createServiceRoleClient();
+      const memoryOn = isMemoryFeatureEnabled() && Boolean(supabase && memoryUserId);
+      const lastUserText = getLastUserText(messages);
+      const userTurns = countUserTurns(messages);
+      const preferredLanguage: ReplyLanguage =
+        detectExplicitReplyLanguage(lastUserText) || detectInputLanguage(lastUserText);
+      const routedTask = routeTask(lastUserText);
+      const responseMode = routedTask.responseMode;
+      const strictTaskType = routedTask.taskType;
+      const longInput = (lastUserText?.length || 0) >= CYDONIA_LONG_INPUT_THRESHOLD;
+      const cydoniaModel = isCydoniaModel(runtimeModel);
+      const relaxConstraintsForLongInput = cydoniaModel && longInput;
+      const promptProfile: PromptProfile = cydoniaModel ? "cydonia" : "default";
+
+      let l2SummaryText: string | undefined;
+      let l3MemoryPrompt: string | undefined;
+
+      if (memoryOn && supabase && memoryUserId && conversationId) {
+        l2SummaryText = await storage.conversation.getSummary(memoryUserId, memoryOrgId, conversationId);
       }
-      runtimeModel = OLLAMA_FALLBACK_MODEL;
-      console.warn(`chat route: model ${activeModel} unavailable, fallback to ${runtimeModel}`);
-    }
-
-    const supabase = storage.createServiceRoleClient();
-    const memoryOn = isMemoryFeatureEnabled() && Boolean(supabase && memoryUserId);
-    const lastUserText = getLastUserText(messages);
-    const userTurns = countUserTurns(messages);
-    const preferredLanguage: ReplyLanguage =
-      detectExplicitReplyLanguage(lastUserText) || detectInputLanguage(lastUserText);
-    const routedTask = routeTask(lastUserText);
-    const responseMode = routedTask.responseMode;
-    const strictTaskType = routedTask.taskType;
-    const longInput = (lastUserText?.length || 0) >= CYDONIA_LONG_INPUT_THRESHOLD;
-    const cydoniaModel = isCydoniaModel(runtimeModel);
-    const relaxConstraintsForLongInput = cydoniaModel && longInput;
-    const promptProfile: PromptProfile = cydoniaModel ? "cydonia" : "default";
-
-    let l2SummaryText: string | undefined;
-    let l3MemoryPrompt: string | undefined;
-
-    if (memoryOn && supabase && memoryUserId && conversationId) {
-      l2SummaryText = await storage.conversation.getSummary(
-        memoryUserId,
-        memoryOrgId,
-        conversationId,
-      );
-    }
 
     if (memoryOn && supabase && memoryUserId && lastUserText) {
       l3MemoryPrompt = await withTimeout(
@@ -703,7 +702,8 @@ export async function POST(req: Request) {
       }
     }
 
-    return result.toUIMessageStreamResponse();
+      return result.toUIMessageStreamResponse();
+    });
   } catch (error) {
     console.error("chat route error:", error);
     return Response.json(

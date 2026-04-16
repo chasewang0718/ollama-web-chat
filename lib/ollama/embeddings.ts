@@ -3,11 +3,14 @@
  * 使用本地 Ollama 的 /api/embeddings，无需额外云端 embedding 服务。
  */
 
+import { OllamaBusyError, tryRunOllamaExclusive } from "@/lib/ollama/scheduler";
+
 const DEFAULT_HOST = "http://127.0.0.1:11434";
 const DEFAULT_MODEL = "nomic-embed-text";
 /** 须与 Supabase `memories.embedding vector(N)` 的 N 一致；nomic-embed-text 为 768 */
 const DEFAULT_DIM = 768;
 const DEFAULT_EMBED_TIMEOUT_MS = 12_000;
+const DEFAULT_EMBED_LOCK_WAIT_MS = 0;
 
 export function getExpectedEmbeddingDimensions(): number {
   const raw = process.env.EMBEDDING_DIMENSIONS;
@@ -20,32 +23,46 @@ export async function embedText(text: string): Promise<number[]> {
   const host = (process.env.OLLAMA_HOST || DEFAULT_HOST).replace(/\/$/, "");
   const model = process.env.OLLAMA_EMBED_MODEL || DEFAULT_MODEL;
   const timeoutMs = Number.parseInt(process.env.OLLAMA_EMBED_TIMEOUT_MS || "", 10) || DEFAULT_EMBED_TIMEOUT_MS;
+  const lockWaitMs =
+    Number.parseInt(process.env.OLLAMA_EMBED_LOCK_WAIT_MS || "", 10) || DEFAULT_EMBED_LOCK_WAIT_MS;
 
-  const response = await fetch(`${host}/api/embeddings`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, prompt: text }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+  try {
+    return await tryRunOllamaExclusive(
+      async () => {
+        const response = await fetch(`${host}/api/embeddings`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model, prompt: text }),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Ollama embeddings failed: ${response.status} ${err}`);
-  }
+        if (!response.ok) {
+          const err = await response.text();
+          throw new Error(`Ollama embeddings failed: ${response.status} ${err}`);
+        }
 
-  const data = (await response.json()) as { embedding?: number[] };
-  if (!data.embedding?.length) {
-    throw new Error("Ollama embeddings: empty embedding");
-  }
+        const data = (await response.json()) as { embedding?: number[] };
+        if (!data.embedding?.length) {
+          throw new Error("Ollama embeddings: empty embedding");
+        }
 
-  const expected = getExpectedEmbeddingDimensions();
-  if (data.embedding.length !== expected) {
-    throw new Error(
-      `Embedding dim mismatch: got ${data.embedding.length}, expected ${expected}. Set EMBEDDING_DIMENSIONS or fix SQL vector(N).`,
+        const expected = getExpectedEmbeddingDimensions();
+        if (data.embedding.length !== expected) {
+          throw new Error(
+            `Embedding dim mismatch: got ${data.embedding.length}, expected ${expected}. Set EMBEDDING_DIMENSIONS or fix SQL vector(N).`,
+          );
+        }
+
+        return data.embedding;
+      },
+      { waitMs: lockWaitMs },
     );
+  } catch (error) {
+    if (error instanceof OllamaBusyError) {
+      throw new Error("Ollama embeddings skipped: engine busy");
+    }
+    throw error;
   }
-
-  return data.embedding;
 }
 
 export function vectorToPgString(embedding: number[]): string {
