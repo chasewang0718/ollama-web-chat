@@ -22,6 +22,10 @@ const RULE_HINT_PATTERNS = [
   /\b(rule|constraint|must|forbidden|style|tone|objective|id|setting)\b/i,
 ];
 const MEMORY_SNIPPET_MAX_CHARS = Number.parseInt(process.env.MEMORY_SNIPPET_MAX_CHARS || "320", 10) || 320;
+const MEMORY_RETRIEVE_COOLDOWN_MS =
+  Number.parseInt(process.env.MEMORY_RETRIEVE_COOLDOWN_MS || "", 10) || 90_000;
+let memoryRetrieveCooldownUntil = 0;
+let memoryRetrieveCooldownLoggedAt = 0;
 
 function compactWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -130,6 +134,18 @@ function isLowValueSnippet(text: string): boolean {
 function clampSnippet(text: string): string {
   if (text.length <= MEMORY_SNIPPET_MAX_CHARS) return text;
   return `${text.slice(0, MEMORY_SNIPPET_MAX_CHARS)}...`;
+}
+
+function isTimeoutLikeError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const maybe = error as { name?: string; code?: string | number; message?: string };
+  const message = maybe.message?.toLowerCase() || "";
+  return (
+    maybe.name === "TimeoutError" ||
+    maybe.code === 23 ||
+    maybe.code === "UND_ERR_HEADERS_TIMEOUT" ||
+    message.includes("timeout")
+  );
 }
 
 function inferMemoryImportance(userText: string, assistantText: string): number {
@@ -261,11 +277,26 @@ export async function buildMemorySystemPrompt(
 ): Promise<string | undefined> {
   const trimmed = userQuery.trim();
   if (!trimmed) return undefined;
+  const now = Date.now();
+  if (now < memoryRetrieveCooldownUntil) {
+    const secondsLeft = Math.ceil((memoryRetrieveCooldownUntil - now) / 1000);
+    if (now - memoryRetrieveCooldownLoggedAt > 30_000) {
+      console.warn(`memory retrieve: skipped during cooldown (${secondsLeft}s left)`);
+      memoryRetrieveCooldownLoggedAt = now;
+    }
+    return undefined;
+  }
 
   let embedding: number[];
   try {
     embedding = await embedText(trimmed);
   } catch (e) {
+    if (isTimeoutLikeError(e)) {
+      memoryRetrieveCooldownUntil = Date.now() + MEMORY_RETRIEVE_COOLDOWN_MS;
+      memoryRetrieveCooldownLoggedAt = Date.now();
+      console.warn(`memory retrieve: embed timeout, cooldown ${Math.ceil(MEMORY_RETRIEVE_COOLDOWN_MS / 1000)}s`);
+      return undefined;
+    }
     console.warn("memory retrieve: embed failed", e);
     return undefined;
   }

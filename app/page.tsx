@@ -51,21 +51,37 @@ export default function Chat() {
   const [showMobileHistory, setShowMobileHistory] = useState(false);
   const [mobileActionsConversationId, setMobileActionsConversationId] = useState<string | null>(null);
   const isBusy = status === 'submitted' || status === 'streaming';
+  const requestStartedAtRef = useRef<number | null>(null);
+  const [busyElapsedMs, setBusyElapsedMs] = useState(0);
+  const lastTokenAtRef = useRef<number | null>(null);
+  const lastAssistantSnapshotRef = useRef('');
+  const [streamIdleMs, setStreamIdleMs] = useState(0);
+  const healInFlightRef = useRef(false);
+  const lastHealAtRef = useRef(0);
+  const autoTitleInFlightRef = useRef(new Set<string>());
+  const autoTitledRef = useRef(new Set<string>());
 
-  const handleSelectModel = async (nextModel: string) => {
+  const handleSelectModel = (nextModel: string) => {
     if (!nextModel || nextModel === selectedModel) return;
-    const previousModel = selectedModel;
     setSelectedModel(nextModel);
-    try {
-      await fetch('/api/models/unload', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: previousModel }),
-      });
-    } catch {
-      // best-effort unload; keep UI responsive even if unload fails
-    }
   };
+
+  useEffect(() => {
+    if (!isBusy) {
+      requestStartedAtRef.current = null;
+      setBusyElapsedMs(0);
+      return;
+    }
+    if (requestStartedAtRef.current === null) {
+      requestStartedAtRef.current = Date.now();
+    }
+    setBusyElapsedMs(Date.now() - requestStartedAtRef.current);
+    const timer = window.setInterval(() => {
+      if (requestStartedAtRef.current === null) return;
+      setBusyElapsedMs(Date.now() - requestStartedAtRef.current);
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [isBusy]);
 
   const getBackendLabel = (backend: ConversationItem['storage_backend']) => {
     if (backend === 'local') return '本地';
@@ -375,7 +391,76 @@ export default function Chat() {
       })),
     [messages],
   );
+
+  const isUntitledConversation = (title?: string): boolean => {
+    const value = (title || '').trim();
+    return value.length === 0 || value === '新对话';
+  };
+
+  const buildTitleFromFirstAssistantReply = (raw: string): string | undefined => {
+    const text = raw
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/`[^`]*`/g, ' ')
+      .replace(/[#>*_\-\[\]\(\)]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (text.length < 16) return undefined;
+    const firstSentence = text.split(/[。！？!?]/)[0]?.trim() || text;
+    const title = firstSentence.slice(0, 28).trim();
+    return title.length >= 6 ? title : undefined;
+  };
+  const latestAssistantText = useMemo(() => {
+    for (let i = renderedMessages.length - 1; i >= 0; i -= 1) {
+      if (renderedMessages[i].role === 'assistant') {
+        return renderedMessages[i].text;
+      }
+    }
+    return '';
+  }, [renderedMessages]);
+  const busyStatusText = useMemo(() => {
+    if (!isBusy) return '';
+    const totalSeconds = Math.floor(busyElapsedMs / 1000);
+    if (status === 'submitted') {
+      if (totalSeconds < 12) return `状态：请求已提交，首字生成中（${totalSeconds}s）`;
+      if (totalSeconds < 25) return `状态：首字延迟偏高，建议继续等待（${totalSeconds}s）`;
+      return `状态判定：首字超时，建议停止后重试或切换模型（${totalSeconds}s）`;
+    }
+    const idleSeconds = Math.floor(streamIdleMs / 1000);
+    if (idleSeconds <= 2) {
+      return `状态：流式生成中，持续接收输出（总耗时 ${totalSeconds}s）`;
+    }
+    if (idleSeconds < 12) {
+      return `状态：流式连接已建立，短暂停顿（${idleSeconds}s，累计 ${totalSeconds}s）`;
+    }
+    if (idleSeconds < 25) {
+      return `状态判定：流输出停滞，建议停止后重试（停滞 ${idleSeconds}s，累计 ${totalSeconds}s）`;
+    }
+    return `状态判定：流输出超时，建议重试或切换模型（停滞 ${idleSeconds}s，累计 ${totalSeconds}s）`;
+  }, [busyElapsedMs, isBusy, status, streamIdleMs]);
+  const activeAssistantMessageId = useMemo(() => {
+    if (!isBusy) return null;
+    for (let i = renderedMessages.length - 1; i >= 0; i -= 1) {
+      if (renderedMessages[i].role === 'assistant') {
+        return renderedMessages[i].id;
+      }
+    }
+    return null;
+  }, [isBusy, renderedMessages]);
   const canRetry = !isBusy && renderedMessages.length > 0;
+  const chatErrorText = useMemo(() => {
+    if (!error) return '';
+    const raw = (error as Error).message || '';
+    if (/不在 Ollama 列表中|not in ollama/i.test(raw)) {
+      return '当前模型不存在于本地 Ollama，请先安装该模型或切换到可用模型。';
+    }
+    if (/无法连接 Ollama|ollama.*(connect|connection|unreachable|econn|fetch failed)/i.test(raw)) {
+      return '无法连接 Ollama 服务，请确认 Ollama 已启动且地址配置正确。';
+    }
+    if (/当前不可用|stopping|loading model|model.*unavailable/i.test(raw)) {
+      return '模型当前不可用（可能正在停止/加载），请稍后重试或切换模型。';
+    }
+    return `请求失败：${raw || '请稍后重试。'}`;
+  }, [error]);
   const contextConversation = contextMenu
     ? conversations.find((item) => item.id === contextMenu.conversationId)
     : undefined;
@@ -466,6 +551,89 @@ export default function Chat() {
         onDone: () => setMobileActionsConversationId(null),
       })
     : [];
+
+  useEffect(() => {
+    if (status !== 'streaming') {
+      lastTokenAtRef.current = null;
+      lastAssistantSnapshotRef.current = '';
+      setStreamIdleMs(0);
+      return;
+    }
+
+    if (latestAssistantText !== lastAssistantSnapshotRef.current) {
+      lastAssistantSnapshotRef.current = latestAssistantText;
+      lastTokenAtRef.current = Date.now();
+      setStreamIdleMs(0);
+    } else if (lastTokenAtRef.current === null) {
+      lastTokenAtRef.current = Date.now();
+      setStreamIdleMs(0);
+    }
+
+    const timer = window.setInterval(() => {
+      if (lastTokenAtRef.current === null) return;
+      setStreamIdleMs(Date.now() - lastTokenAtRef.current);
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [latestAssistantText, status]);
+
+  useEffect(() => {
+    if (!isBusy) return;
+    const now = Date.now();
+    const shouldHeal =
+      (status === 'submitted' && busyElapsedMs >= 25_000) ||
+      (status === 'streaming' && streamIdleMs >= 25_000);
+    if (!shouldHeal) return;
+    if (healInFlightRef.current) return;
+    if (now - lastHealAtRef.current < 90_000) return;
+
+    healInFlightRef.current = true;
+    lastHealAtRef.current = now;
+    void fetch('/api/ollama/heal', { method: 'POST' }).finally(() => {
+      healInFlightRef.current = false;
+    });
+  }, [busyElapsedMs, isBusy, status, streamIdleMs]);
+
+  useEffect(() => {
+    if (!activeConversationId) return;
+    const currentConversation = conversations.find((item) => item.id === activeConversationId);
+    if (!currentConversation) return;
+    if (!isUntitledConversation(currentConversation.title)) return;
+    if (autoTitledRef.current.has(activeConversationId)) return;
+    if (autoTitleInFlightRef.current.has(activeConversationId)) return;
+
+    const firstAssistant = renderedMessages.find((m) => m.role === 'assistant' && m.text.trim().length > 0);
+    const firstUser = renderedMessages.find((m) => m.role === 'user' && m.text.trim().length > 0);
+    if (!firstAssistant || !firstUser) return;
+
+    const title = buildTitleFromFirstAssistantReply(firstAssistant.text);
+    if (!title) return;
+
+    autoTitleInFlightRef.current.add(activeConversationId);
+
+    // Optimistic UI: update sidebar immediately.
+    const nowIso = new Date().toISOString();
+    setConversations((items) => {
+      const next = items.map((item) =>
+        item.id === activeConversationId ? { ...item, title, updated_at: nowIso } : item,
+      );
+      next.sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
+      return next;
+    });
+
+    void fetch(`/api/conversations/${activeConversationId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    })
+      .then((res) => {
+        if (res.ok) {
+          autoTitledRef.current.add(activeConversationId);
+        }
+      })
+      .finally(() => {
+        autoTitleInFlightRef.current.delete(activeConversationId);
+      });
+  }, [activeConversationId, conversations, renderedMessages]);
 
   const resolveRedoTextByMessageIndex = (index: number): string | undefined => {
     const current = renderedMessages[index];
@@ -569,11 +737,11 @@ export default function Chat() {
 
     if (error) clearError();
     lastActivityAtRef.current = Date.now();
+    setInput('');
     await sendMessage(
       { text: value },
       { body: { model: selectedModel, conversationId: activeConversationId } },
     );
-    setInput('');
   };
 
   const handleRetry = async () => {
@@ -904,6 +1072,8 @@ export default function Chat() {
 
             {renderedMessages.map((message, index) => {
               const isUser = message.role === 'user';
+              const isStreamingAssistant =
+                !isUser && isBusy && activeAssistantMessageId !== null && message.id === activeAssistantMessageId;
               return (
                 <div key={message.id} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
                   {isUser ? (
@@ -993,17 +1163,21 @@ export default function Chat() {
                     <div className="w-full px-2 py-1 text-base leading-6 text-slate-800">
                       <div className="mb-2 flex items-center gap-2 text-slate-500">
                         <span className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-slate-300 bg-white text-slate-900 shadow-sm">
-                          <svg viewBox="0 0 64 64" className="h-6 w-6" aria-hidden="true">
-                            <g fill="none" stroke="currentColor" strokeWidth="3.2" strokeLinecap="round" strokeLinejoin="round">
-                              <path d="M20 18v10" />
-                              <path d="M44 18v10" />
-                              <path d="M16 29c0-10 7-16 16-16s16 6 16 16v16c0 8-6 14-14 14h-4c-8 0-14-6-14-14V29z" />
-                              <circle cx="25" cy="34" r="1.6" fill="currentColor" />
-                              <circle cx="39" cy="34" r="1.6" fill="currentColor" />
-                              <ellipse cx="32" cy="41" rx="9" ry="6" />
-                              <circle cx="32" cy="41" r="1.8" fill="currentColor" />
-                            </g>
-                          </svg>
+                          {isStreamingAssistant ? (
+                            <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-slate-700" />
+                          ) : (
+                            <svg viewBox="0 0 64 64" className="h-6 w-6" aria-hidden="true">
+                              <g fill="none" stroke="currentColor" strokeWidth="3.2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M20 18v10" />
+                                <path d="M44 18v10" />
+                                <path d="M16 29c0-10 7-16 16-16s16 6 16 16v16c0 8-6 14-14 14h-4c-8 0-14-6-14-14V29z" />
+                                <circle cx="25" cy="34" r="1.6" fill="currentColor" />
+                                <circle cx="39" cy="34" r="1.6" fill="currentColor" />
+                                <ellipse cx="32" cy="41" rx="9" ry="6" />
+                                <circle cx="32" cy="41" r="1.8" fill="currentColor" />
+                              </g>
+                            </svg>
+                          )}
                         </span>
                         <span className="text-xs font-medium text-slate-500">助手回复</span>
                       </div>
@@ -1082,7 +1256,7 @@ export default function Chat() {
                     void handleSubmit(event as unknown as FormEvent<HTMLFormElement>);
                   }
                 }}
-                disabled={isBusy || !activeConversationId}
+                disabled={!activeConversationId}
               />
               <div className="mt-3 flex items-center justify-between gap-3 border-t border-slate-100 pt-3">
                 <div className="flex items-center gap-3">
@@ -1147,9 +1321,9 @@ export default function Chat() {
             </div>
           </div>
           <div className="mx-auto w-full max-w-3xl px-4 pb-4 text-xs">
-            {isBusy && <p className="text-slate-500">AI 正在回复...</p>}
+            {isBusy && <p className="text-slate-500">{busyStatusText}</p>}
             {modelsError && <p className="text-amber-600">{modelsError}</p>}
-            {error && <p className="text-red-500">连接失败，请确认 Ollama 服务已启动。</p>}
+            {chatErrorText && <p className="text-red-500">{chatErrorText}</p>}
           </div>
         </form>
       </div>
