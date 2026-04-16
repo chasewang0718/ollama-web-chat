@@ -38,6 +38,7 @@ const OLLAMA_LARGE_MODEL_B_THRESHOLD =
 const OLLAMA_LARGE_MODEL_DISABLE_MEMORY = process.env.OLLAMA_LARGE_MODEL_DISABLE_MEMORY !== "false";
 const OLLAMA_LARGE_MODEL_MAX_OUTPUT_TOKENS =
   Number.parseInt(process.env.OLLAMA_LARGE_MODEL_MAX_OUTPUT_TOKENS || "", 10) || 480;
+const STORAGE_HYBRID_LEGACY_PROBE_ENABLED = process.env.STORAGE_HYBRID_LEGACY_PROBE !== "false";
 
 const execAsync = promisify(exec);
 let ollamaAutoHealUntil = 0;
@@ -520,8 +521,14 @@ export async function POST(req: Request) {
     let selectedBackend = backend || resolveDefaultBackendForNewConversation(getStorageMode());
 
     // Legacy compatibility for pre-binding conversations in hybrid mode:
-    // probe both backends, then persist binding once source is identified.
-    if (!backend && conversationId && memoryUserId && getStorageMode() === "hybrid") {
+    // optional probe of both backends, then persist binding once source is identified.
+    if (
+      STORAGE_HYBRID_LEGACY_PROBE_ENABLED &&
+      !backend &&
+      conversationId &&
+      memoryUserId &&
+      getStorageMode() === "hybrid"
+    ) {
       const cloudReady = await ensureBackendReady("cloud");
       const localReady = await ensureBackendReady("local");
       const cloudMessages = cloudReady.ok
@@ -549,6 +556,10 @@ export async function POST(req: Request) {
       if (bindingClient) {
         await bindConversationBackend(bindingClient, memoryUserId, memoryOrgId, conversationId, selectedBackend);
       }
+    } else if (!backend && conversationId && getStorageMode() === "hybrid") {
+      console.warn(
+        "chat route: hybrid legacy probe disabled; relying on control-plane binding/default backend resolution.",
+      );
     }
 
     const selectedReady = await ensureBackendReady(selectedBackend);
