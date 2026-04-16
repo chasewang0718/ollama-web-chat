@@ -620,55 +620,66 @@ export async function POST(req: Request) {
         return;
       }
 
-      await storage.memory.persistTurn(
-        supabase,
-        memoryUserId,
-        memoryOrgId,
-        lastUserText,
-        text,
-        conversationId,
-      );
+      // Two-phase memory path:
+      // 1) return chat response immediately
+      // 2) run memory persist / summary maintenance in background (best-effort)
+      queueMicrotask(() => {
+        void (async () => {
+          try {
+            await storage.memory.persistTurn(
+              supabase,
+              memoryUserId,
+              memoryOrgId,
+              lastUserText,
+              text,
+              conversationId,
+            );
 
-      const conversationMessages: UIMessage[] = [
-        ...messages,
-        {
-          id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-assistant`,
-          role: "assistant",
-          parts: [{ type: "text", text }],
-        } as UIMessage,
-      ];
+            const conversationMessages: UIMessage[] = [
+              ...messages,
+              {
+                id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-assistant`,
+                role: "assistant",
+                parts: [{ type: "text", text }],
+              } as UIMessage,
+            ];
 
-      const healthInterval =
-        Number.parseInt(process.env.MEMORY_HEALTHCHECK_INTERVAL || "20", 10) || 20;
-      if (userTurns > 0 && userTurns % healthInterval === 0) {
-        await storage.memory.runHealthCheck(supabase, memoryUserId, memoryOrgId);
-      }
+            const healthInterval =
+              Number.parseInt(process.env.MEMORY_HEALTHCHECK_INTERVAL || "20", 10) || 20;
+            if (userTurns > 0 && userTurns % healthInterval === 0) {
+              await storage.memory.runHealthCheck(supabase, memoryUserId, memoryOrgId);
+            }
 
-      const interval = Number.parseInt(process.env.MEMORY_SUMMARY_INTERVAL || "8", 10) || 8;
-      if (!storage.summary.shouldRefresh(userTurns, interval)) {
-        await storage.conversation.saveState({
-          userId: memoryUserId,
-          orgId: memoryOrgId,
-          conversationId: conversationId || "default",
-          messages: conversationMessages,
-        });
-        return;
-      }
+            const interval = Number.parseInt(process.env.MEMORY_SUMMARY_INTERVAL || "8", 10) || 8;
+            if (!storage.summary.shouldRefresh(userTurns, interval)) {
+              await storage.conversation.saveState({
+                userId: memoryUserId,
+                orgId: memoryOrgId,
+                conversationId: conversationId || "default",
+                messages: conversationMessages,
+              });
+              return;
+            }
 
-      const recentConversation = formatRecentConversation(messages, 14);
-      if (!recentConversation.trim()) return;
+            const recentConversation = formatRecentConversation(messages, 14);
+            if (!recentConversation.trim()) return;
 
-      const generatedSummary = await storage.summary.generate(
-        recentConversation,
-        l2SummaryText,
-        runtimeModel,
-      );
-      await storage.conversation.saveState({
-        userId: memoryUserId,
-        orgId: memoryOrgId,
-        conversationId: conversationId || "default",
-        messages: conversationMessages,
-        summary: generatedSummary,
+            const generatedSummary = await storage.summary.generate(
+              recentConversation,
+              l2SummaryText,
+              runtimeModel,
+            );
+            await storage.conversation.saveState({
+              userId: memoryUserId,
+              orgId: memoryOrgId,
+              conversationId: conversationId || "default",
+              messages: conversationMessages,
+              summary: generatedSummary,
+            });
+          } catch (error) {
+            console.warn("chat route: async memory pipeline failed", error);
+          }
+        })();
       });
     };
 
