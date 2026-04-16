@@ -5,6 +5,11 @@ import { promisify } from "node:util";
 
 import { acquireOllamaExclusive } from "@/lib/ollama/scheduler";
 import {
+  applyLargeModelGenerationSafety,
+  isLargeModel,
+  shouldDisableMemoryForModel,
+} from "@/lib/ollama/runtime-policy";
+import {
   countUserTurns,
   formatRecentConversation,
   getLastUserText,
@@ -33,11 +38,6 @@ const OLLAMA_AUTO_HEAL_VERIFY_TIMEOUT_MS =
   Number.parseInt(process.env.OLLAMA_AUTO_HEAL_VERIFY_TIMEOUT_MS || "", 10) || 25_000;
 const OLLAMA_AUTO_FALLBACK_ENABLED = process.env.OLLAMA_AUTO_FALLBACK !== "false";
 const OLLAMA_FALLBACK_MODEL = (process.env.OLLAMA_FALLBACK_MODEL || "gemma2:9b").trim();
-const OLLAMA_LARGE_MODEL_B_THRESHOLD =
-  Number.parseFloat(process.env.OLLAMA_LARGE_MODEL_B_THRESHOLD || "") || 20;
-const OLLAMA_LARGE_MODEL_DISABLE_MEMORY = process.env.OLLAMA_LARGE_MODEL_DISABLE_MEMORY !== "false";
-const OLLAMA_LARGE_MODEL_MAX_OUTPUT_TOKENS =
-  Number.parseInt(process.env.OLLAMA_LARGE_MODEL_MAX_OUTPUT_TOKENS || "", 10) || 480;
 const STORAGE_HYBRID_LEGACY_PROBE_ENABLED = process.env.STORAGE_HYBRID_LEGACY_PROBE !== "false";
 
 const execAsync = promisify(exec);
@@ -75,18 +75,6 @@ function isModelLoadFailure(error: unknown): boolean {
 
 function isCydoniaModel(model: string): boolean {
   return /^cydonia/i.test(model.trim());
-}
-
-function getModelSizeInBillions(model: string): number | undefined {
-  const matched = model.toLowerCase().match(/(\d+(?:\.\d+)?)b(?:\b|[-_:])/);
-  if (!matched) return undefined;
-  const n = Number.parseFloat(matched[1]);
-  return Number.isFinite(n) ? n : undefined;
-}
-
-function isLargeModel(model: string): boolean {
-  const sizeB = getModelSizeInBillions(model);
-  return typeof sizeB === "number" && sizeB >= OLLAMA_LARGE_MODEL_B_THRESHOLD;
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
@@ -600,7 +588,7 @@ export async function POST(req: Request) {
       const memoryOn =
         isMemoryFeatureEnabled() &&
         Boolean(supabase && memoryUserId) &&
-        !(largeModel && OLLAMA_LARGE_MODEL_DISABLE_MEMORY);
+        !shouldDisableMemoryForModel(runtimeModel);
       const lastUserText = getLastUserText(messages);
       const userTurns = countUserTurns(messages);
       const preferredLanguage: ReplyLanguage =
@@ -645,13 +633,11 @@ export async function POST(req: Request) {
       routedTask.confidence,
       { relaxedForLongInput: relaxConstraintsForLongInput, promptProfile },
     );
-    const generationProfile = getGenerationProfile(strictTaskType, responseMode, cydoniaModel, longInput);
+      const generationProfile = applyLargeModelGenerationSafety(
+        runtimeModel,
+        getGenerationProfile(strictTaskType, responseMode, cydoniaModel, longInput),
+      );
       if (largeModel) {
-        const clamped = Math.max(128, OLLAMA_LARGE_MODEL_MAX_OUTPUT_TOKENS);
-        generationProfile.maxOutputTokens =
-          typeof generationProfile.maxOutputTokens === "number"
-            ? Math.min(generationProfile.maxOutputTokens, clamped)
-            : clamped;
         console.warn(
           `chat route: large model profile enabled for ${runtimeModel} (memory=${memoryOn ? "on" : "off"}, maxOutputTokens=${generationProfile.maxOutputTokens})`,
         );
