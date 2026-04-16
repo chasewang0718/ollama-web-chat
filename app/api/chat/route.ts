@@ -3,7 +3,7 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 
-import { runOllamaExclusive } from "@/lib/ollama/scheduler";
+import { acquireOllamaExclusive } from "@/lib/ollama/scheduler";
 import {
   countUserTurns,
   formatRecentConversation,
@@ -540,7 +540,8 @@ export async function POST(req: Request) {
     }
 
     const storage = getStorageProviderForBackend(selectedBackend);
-    return await runOllamaExclusive(async () => {
+    const release = await acquireOllamaExclusive();
+    try {
       const activeModel = model || modelName;
       let runtimeModel = activeModel;
       if (isModelQuarantined(runtimeModel) && OLLAMA_AUTO_FALLBACK_ENABLED && OLLAMA_FALLBACK_MODEL) {
@@ -702,8 +703,45 @@ export async function POST(req: Request) {
       }
     }
 
-      return result.toUIMessageStreamResponse();
-    });
+      const response = result.toUIMessageStreamResponse();
+      const body = response.body;
+      if (!body) {
+        release();
+        return response;
+      }
+
+      const reader = body.getReader();
+      const wrapped = new ReadableStream<Uint8Array>({
+        pull: async (controller) => {
+          try {
+            const { done, value } = await reader.read();
+            if (done) {
+              release();
+              controller.close();
+              return;
+            }
+            if (value) controller.enqueue(value);
+          } catch (error) {
+            release();
+            controller.error(error);
+          }
+        },
+        cancel: async () => {
+          release();
+          await reader.cancel().catch(() => undefined);
+        },
+      });
+
+      // Preserve headers/status while ensuring lock releases only after stream ends.
+      return new Response(wrapped, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
+    } catch (error) {
+      release();
+      throw error;
+    }
   } catch (error) {
     console.error("chat route error:", error);
     return Response.json(

@@ -40,6 +40,15 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((r) => setTimeout(r, ms));
 }
 
+function once(fn: () => void): () => void {
+  let called = false;
+  return () => {
+    if (called) return;
+    called = true;
+    fn();
+  };
+}
+
 export async function runOllamaExclusive<T>(fn: () => Promise<T>): Promise<T> {
   const state = als.getStore();
   if (state) {
@@ -56,6 +65,31 @@ export async function runOllamaExclusive<T>(fn: () => Promise<T>): Promise<T> {
     return await als.run({ depth: 1 }, fn);
   } finally {
     releaseGlobal();
+  }
+}
+
+/**
+ * Acquire the global Ollama lock and return a release callback.
+ * Note: this is intended for long-lived operations (e.g. streaming) where the caller
+ * must control when the lock is released.
+ */
+export async function acquireOllamaExclusive(): Promise<() => void> {
+  await acquireGlobal();
+  return once(() => releaseGlobal());
+}
+
+export async function tryAcquireOllamaExclusive(options?: { waitMs?: number }): Promise<() => void> {
+  const waitMs = options?.waitMs ?? 0;
+  const started = Date.now();
+  while (true) {
+    if (!locked) {
+      await acquireGlobal();
+      return once(() => releaseGlobal());
+    }
+    if (Date.now() - started >= waitMs) {
+      throw new OllamaBusyError();
+    }
+    await sleep(25);
   }
 }
 
