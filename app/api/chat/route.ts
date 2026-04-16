@@ -7,6 +7,7 @@ import {
   getLastUserText,
 } from "@/lib/memory/messages";
 import { bindConversationBackend, getConversationBackend } from "@/lib/storage/bindings";
+import { ensureBackendReady } from "@/lib/storage/connection";
 import {
   getControlPlaneStorageProvider,
   getStorageMode,
@@ -16,6 +17,7 @@ import {
 import { getMemoryOrgId } from "@/lib/supabase/service";
 
 const modelName = process.env.OLLAMA_MODEL || "gemma2:9b";
+const CYDONIA_LONG_INPUT_THRESHOLD = 1200;
 
 const ollama = createOpenAICompatible({
   name: "ollama",
@@ -28,6 +30,13 @@ function isMemoryFeatureEnabled(): boolean {
 }
 
 type ReplyLanguage = "same" | "zh" | "en" | "nl" | "ja";
+type ResponseMode = "strict-task" | "creative-continue";
+type StrictTaskType = "summarize" | "extract" | "analyze" | "qa" | "generic";
+type PromptProfile = "default" | "cydonia";
+
+function isCydoniaModel(model: string): boolean {
+  return /^cydonia/i.test(model.trim());
+}
 
 function detectExplicitReplyLanguage(text: string | undefined): ReplyLanguage | undefined {
   if (!text) return undefined;
@@ -52,12 +61,44 @@ function detectInputLanguage(text: string | undefined): ReplyLanguage {
   return "same";
 }
 
+function detectResponseMode(text: string | undefined): ResponseMode {
+  if (!text) return "strict-task";
+  const t = text.toLowerCase();
+  if (
+    /续写|接着写|继续写|写下一段|写后续|扩写|润色|改写|重写|仿写|优化文案|美化表达|调整语气/.test(
+      t,
+    ) ||
+    /continue writing|continue the story|story continuation|write the next|expand|elaborate|polish|rewrite|rephrase|paraphrase|copyedit/.test(
+      t,
+    )
+  ) {
+    return "creative-continue";
+  }
+  return "strict-task";
+}
+
+function detectStrictTaskType(text: string | undefined): StrictTaskType {
+  if (!text) return "generic";
+  const t = text.toLowerCase();
+  if (/总结|摘要|概括|总结一下|核心观点|summary|summarize/.test(t)) return "summarize";
+  if (/提取|抽取|信息抽取|要点提取|extract|list out|identify/.test(t)) return "extract";
+  if (/分析|问题|建议|漏洞|评估|analyze|analysis|review/.test(t)) return "analyze";
+  if (/回答|问答|解答|question|answer/.test(t)) return "qa";
+  return "generic";
+}
+
 function buildCombinedSystemPrompt(
   l2Summary?: string,
   l3Memory?: string,
   preferredLanguage: ReplyLanguage = "same",
+  responseMode: ResponseMode = "strict-task",
+  strictTaskType: StrictTaskType = "generic",
+  options?: { relaxedForLongInput?: boolean; promptProfile?: PromptProfile },
 ): string | undefined {
   const sections: string[] = [];
+  const relaxedForLongInput = options?.relaxedForLongInput === true;
+  const promptProfile = options?.promptProfile || "default";
+  const bypassTaskConstraints = promptProfile === "cydonia";
   const languagePolicyByPreference: Record<ReplyLanguage, string> = {
     same:
       "Reply in the same language as the user unless they explicitly request another language. Keep responses natural and concise.",
@@ -68,6 +109,51 @@ function buildCombinedSystemPrompt(
   };
   const behaviorPrompt = languagePolicyByPreference[preferredLanguage];
   sections.push(`[Response Policy]\n${behaviorPrompt}`);
+  if (bypassTaskConstraints) {
+    // Cydonia profile: remove task/format constraints entirely and let the model follow user prompt natively.
+  } else if (relaxedForLongInput) {
+    sections.push(
+      [
+        "[Task Mode]",
+        "Prioritize stable instruction-following for long-input editing tasks.",
+        "Do exactly what the user asks (e.g. polish/rewrite/summarize) and avoid adding unrelated tasks.",
+        "Keep output concise unless the user asks for expansion.",
+      ].join("\n"),
+    );
+  } else if (responseMode === "strict-task") {
+    const strictOutputFormat: Record<StrictTaskType, string> = {
+      summarize:
+        "Output format:\n1) 第一行必须是：你的需求是：<一句话任务复述>\n2) 核心观点（3条项目符号）\n3) 可选：一句结论",
+      extract:
+        "Output format:\n1) 第一行必须是：你的需求是：<一句话任务复述>\n2) 按字段项目符号提取结果\n3) 仅使用原文事实；未提及字段写“未提及”\n4) 禁止添加任何原文中不存在的新句子",
+      analyze:
+        "Output format:\n1) 第一行必须是：你的需求是：<一句话任务复述>\n2) 问题分析（项目符号）\n3) 可执行建议（项目符号）",
+      qa: "Output format:\n1) 第一行必须是：你的需求是：<一句话任务复述>\n2) 直接回答问题\n3) 必要时补充依据",
+      generic:
+        "Output format:\n1) 第一行必须是：你的需求是：<一句话任务复述>\n2) 按用户要求给出结构化结果（项目符号或分段）",
+    };
+    sections.push(
+      [
+        "[Task Mode]",
+        "Default to instruction-following mode, not continuation mode.",
+        "Treat long user text as reference material unless the user explicitly asks for continuation.",
+        "Do not output any narrative/prose line before the required first line.",
+        "The first line must start with: 你的需求是：",
+        "Do not continue or expand user-provided prose unless explicitly requested.",
+        "If your output looks like story continuation, it is incorrect and must be regenerated.",
+        "Do not invent details not present in the user's text for summarize/extract/analyze tasks.",
+        strictOutputFormat[strictTaskType],
+      ].join("\n"),
+    );
+  } else {
+    sections.push(
+      [
+        "[Task Mode]",
+        "Creative continuation mode is enabled because the user explicitly requested continuation.",
+        "Continue writing while preserving tone, facts, and constraints from the provided text.",
+      ].join("\n"),
+    );
+  }
   sections.push(
     "[Identity]\nYou are a local AI model running in Ollama. Never claim to be OpenAI/ChatGPT/GPT-3.5.",
   );
@@ -103,17 +189,19 @@ export async function POST(req: Request) {
     // Legacy compatibility for pre-binding conversations in hybrid mode:
     // probe both backends, then persist binding once source is identified.
     if (!backend && conversationId && memoryUserId && getStorageMode() === "hybrid") {
-      const cloudStorage = getStorageProviderForBackend("cloud");
-      const cloudMessages = await cloudStorage.conversation.getMessages(
-        memoryUserId,
-        memoryOrgId,
-        conversationId,
-      );
+      const cloudReady = await ensureBackendReady("cloud");
+      const localReady = await ensureBackendReady("local");
+      const cloudMessages = cloudReady.ok
+        ? await getStorageProviderForBackend("cloud").conversation.getMessages(
+            memoryUserId,
+            memoryOrgId,
+            conversationId,
+          )
+        : [];
       if (cloudMessages.length > 0) {
         selectedBackend = "cloud";
-      } else {
-        const localStorage = getStorageProviderForBackend("local");
-        const localMessages = await localStorage.conversation.getMessages(
+      } else if (localReady.ok) {
+        const localMessages = await getStorageProviderForBackend("local").conversation.getMessages(
           memoryUserId,
           memoryOrgId,
           conversationId,
@@ -121,11 +209,18 @@ export async function POST(req: Request) {
         if (localMessages.length > 0) {
           selectedBackend = "local";
         }
+      } else {
+        console.warn("chat route local backend unavailable in hybrid probe", localReady.error);
       }
 
       if (bindingClient) {
         await bindConversationBackend(bindingClient, memoryUserId, memoryOrgId, conversationId, selectedBackend);
       }
+    }
+
+    const selectedReady = await ensureBackendReady(selectedBackend);
+    if (!selectedReady.ok) {
+      return Response.json({ error: selectedReady.error }, { status: 503 });
     }
 
     const storage = getStorageProviderForBackend(selectedBackend);
@@ -137,6 +232,12 @@ export async function POST(req: Request) {
     const userTurns = countUserTurns(messages);
     const preferredLanguage: ReplyLanguage =
       detectExplicitReplyLanguage(lastUserText) || detectInputLanguage(lastUserText);
+    const responseMode = detectResponseMode(lastUserText);
+    const strictTaskType = detectStrictTaskType(lastUserText);
+    const longInput = (lastUserText?.length || 0) >= CYDONIA_LONG_INPUT_THRESHOLD;
+    const cydoniaModel = isCydoniaModel(activeModel);
+    const relaxConstraintsForLongInput = cydoniaModel && longInput;
+    const promptProfile: PromptProfile = cydoniaModel ? "cydonia" : "default";
 
     let l2SummaryText: string | undefined;
     let l3MemoryPrompt: string | undefined;
@@ -165,10 +266,30 @@ export async function POST(req: Request) {
       l2SummaryText,
       l3MemoryPrompt,
       preferredLanguage,
+      responseMode,
+      strictTaskType,
+      { relaxedForLongInput: relaxConstraintsForLongInput, promptProfile },
     );
 
     const result = await streamText({
       model: ollama.chatModel(activeModel),
+      temperature:
+        responseMode === "creative-continue"
+          ? cydoniaModel
+            ? 0.55
+            : 0.75
+          : cydoniaModel
+            ? 0.15
+            : 0.2,
+      topP:
+        responseMode === "creative-continue"
+          ? cydoniaModel
+            ? 0.82
+            : 0.92
+          : cydoniaModel
+            ? 0.68
+            : 0.75,
+      ...(cydoniaModel ? { maxOutputTokens: longInput ? 800 : 1100 } : {}),
       ...(systemPrompt ? { system: systemPrompt } : {}),
       messages: baseMessages,
       onFinish: async ({ text }) => {

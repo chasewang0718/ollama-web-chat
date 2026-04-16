@@ -2,6 +2,7 @@ import {
   getConversationBinding,
   listConversationBindings,
 } from "@/lib/storage/bindings";
+import { ensureBackendReady } from "@/lib/storage/connection";
 import {
   migrateConversationBetweenBackends,
   migrateConversationsBatch,
@@ -115,6 +116,10 @@ export async function POST(req: Request) {
     }
 
     const defaultBackend = isBackend(body.targetBackend) ? body.targetBackend : "local";
+    const targetReady = await ensureBackendReady(defaultBackend);
+    if (!targetReady.ok) {
+      return Response.json({ ok: false, error: targetReady.error }, { status: 503 });
+    }
     const batchResult = await migrateConversationsBatch(client, {
       userId,
       orgId,
@@ -142,6 +147,15 @@ export async function POST(req: Request) {
     : currentBackend === "cloud"
       ? "local"
       : "cloud";
+
+  const sourceReady = await ensureBackendReady(currentBackend);
+  if (!sourceReady.ok) {
+    return Response.json({ ok: false, error: sourceReady.error }, { status: 503 });
+  }
+  const targetReady = await ensureBackendReady(targetBackend);
+  if (!targetReady.ok) {
+    return Response.json({ ok: false, error: targetReady.error }, { status: 503 });
+  }
 
   const result = await migrateConversationBetweenBackends(client, {
     userId,

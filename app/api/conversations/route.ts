@@ -1,36 +1,46 @@
 import { bindConversationBackend, listConversationBindings } from "@/lib/storage/bindings";
+import { ensureBackendReady } from "@/lib/storage/connection";
 import {
   getControlPlaneStorageProvider,
   getStorageMode,
   getStorageProvider,
   getStorageProviderForBackend,
+  resolveBackendForNewConversation,
   resolveDefaultBackendForNewConversation,
 } from "@/lib/storage/router";
 import { getMemoryOrgId } from "@/lib/supabase/service";
 
 export async function GET() {
-  const mode = getStorageMode();
   const storage = getStorageProvider();
   const userId = process.env.MEMORY_USER_ID;
   const orgId = getMemoryOrgId();
 
+  const mode = getStorageMode();
+  const defaultNewBackend = resolveDefaultBackendForNewConversation(mode);
+
   if (!userId) {
-    return Response.json({ conversations: [] });
+    return Response.json({
+      conversations: [],
+      storage_mode: mode,
+      default_new_conversation_backend: defaultNewBackend,
+    });
   }
 
   if (mode === "hybrid") {
-    const cloud = await getStorageProviderForBackend("cloud").conversation
-      .list(userId, orgId)
-      .catch((error: unknown) => {
-        console.warn("hybrid list cloud failed", error);
-        return { conversations: [] };
-      });
-    const local = await getStorageProviderForBackend("local").conversation
-      .list(userId, orgId)
-      .catch((error: unknown) => {
-        console.warn("hybrid list local failed", error);
-        return { conversations: [] };
-      });
+    const cloudReady = await ensureBackendReady("cloud");
+    const localReady = await ensureBackendReady("local");
+    const cloud = cloudReady.ok
+      ? await getStorageProviderForBackend("cloud").conversation.list(userId, orgId).catch((error: unknown) => {
+          console.warn("hybrid list cloud failed", error);
+          return { conversations: [] };
+        })
+      : (console.warn("hybrid list cloud skipped", cloudReady.error), { conversations: [] });
+    const local = localReady.ok
+      ? await getStorageProviderForBackend("local").conversation.list(userId, orgId).catch((error: unknown) => {
+          console.warn("hybrid list local failed", error);
+          return { conversations: [] };
+        })
+      : (console.warn("hybrid list local skipped", localReady.error), { conversations: [] });
     const merged = new Map<
       string,
       {
@@ -70,7 +80,11 @@ export async function GET() {
     const conversations = [...merged.values()].sort(
       (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
     );
-    return Response.json({ conversations });
+    return Response.json({
+      conversations,
+      storage_mode: mode,
+      default_new_conversation_backend: defaultNewBackend,
+    });
   }
 
   const result = await storage.conversation.list(userId, orgId);
@@ -85,13 +99,35 @@ export async function GET() {
   const defaultBackend = mode === "local" ? "local" : "cloud";
   return Response.json({
     conversations: result.conversations.map((item) => ({ ...item, storage_backend: defaultBackend })),
+    storage_mode: mode,
+    default_new_conversation_backend: defaultNewBackend,
   });
 }
 
-export async function POST() {
+export async function POST(req: Request) {
   const mode = getStorageMode();
-  const defaultBackend = resolveDefaultBackendForNewConversation(mode);
-  const storage = getStorageProviderForBackend(defaultBackend);
+
+  let requested: "cloud" | "local" | undefined;
+  try {
+    const body = (await req.json()) as { storage_backend?: unknown };
+    if (body?.storage_backend === "cloud" || body?.storage_backend === "local") {
+      requested = body.storage_backend;
+    }
+  } catch {
+    // empty or invalid JSON — use default backend
+  }
+
+  const resolved = resolveBackendForNewConversation(mode, requested);
+  if ("error" in resolved) {
+    return Response.json({ error: resolved.error }, { status: 400 });
+  }
+  const { backend } = resolved;
+  const backendReady = await ensureBackendReady(backend);
+  if (!backendReady.ok) {
+    return Response.json({ error: backendReady.error }, { status: 503 });
+  }
+
+  const storage = getStorageProviderForBackend(backend);
   const controlPlane = getControlPlaneStorageProvider();
   const userId = process.env.MEMORY_USER_ID;
   const orgId = getMemoryOrgId();
@@ -111,8 +147,8 @@ export async function POST() {
 
   const bindingClient = controlPlane.createServiceRoleClient();
   if (bindingClient) {
-    await bindConversationBackend(bindingClient, userId, orgId, conversation.id, defaultBackend);
+    await bindConversationBackend(bindingClient, userId, orgId, conversation.id, backend);
   }
 
-  return Response.json({ conversation: { ...conversation, storage_backend: defaultBackend } });
+  return Response.json({ conversation: { ...conversation, storage_backend: backend } });
 }

@@ -18,6 +18,35 @@ export function resolveDefaultBackendForNewConversation(mode: StorageMode): Stor
 }
 
 /**
+ * Resolves which backend to use when creating a conversation.
+ * Optional `requested` comes from the client (e.g. user chose cloud vs local in hybrid mode).
+ */
+export function resolveBackendForNewConversation(
+  mode: StorageMode,
+  requested?: StorageBackend,
+): { backend: StorageBackend } | { error: string } {
+  if (requested === undefined) {
+    return { backend: resolveDefaultBackendForNewConversation(mode) };
+  }
+  if (mode === "hybrid") {
+    return { backend: requested };
+  }
+  if (mode === "cloud") {
+    if (requested === "local") {
+      return { error: "当前为仅云端模式，无法创建本地会话。" };
+    }
+    return { backend: "cloud" };
+  }
+  if (mode === "local") {
+    if (requested === "cloud") {
+      return { error: "当前为仅本地模式，无法创建云端会话。" };
+    }
+    return { backend: "local" };
+  }
+  return { backend: resolveDefaultBackendForNewConversation(mode) };
+}
+
+/**
  * Iteration 1: keep behavior unchanged.
  * Always route to cloud provider while introducing the router boundary.
  */

@@ -387,7 +387,10 @@ export async function runMemoryHealthCheck(
   await compactMemoryVersions(supabase, userId, orgId);
   await decayMemoryImportance(supabase, userId, orgId);
 
-  const maxItems = Number.parseInt(process.env.MEMORY_MAX_ITEMS || "400", 10) || 400;
+  // "Near-infinite" strategy: keep memory by default, prune only when an explicit hard limit is configured.
+  // Set MEMORY_HARD_MAX_ITEMS=0 (default) to disable overflow deletion.
+  const hardMaxItems = Number.parseInt(process.env.MEMORY_HARD_MAX_ITEMS || "0", 10) || 0;
+  const cleanupStaleEnabled = process.env.MEMORY_CLEANUP_STALE !== "false";
   const staleDays = Number.parseInt(process.env.MEMORY_STALE_DAYS || "120", 10) || 120;
   const staleCutoff = new Date(Date.now() - staleDays * 24 * 60 * 60 * 1000).toISOString();
 
@@ -402,8 +405,8 @@ export async function runMemoryHealthCheck(
     return;
   }
 
-  if ((exactCount || 0) > maxItems) {
-    const overflow = (exactCount || 0) - maxItems;
+  if (hardMaxItems > 0 && (exactCount || 0) > hardMaxItems) {
+    const overflow = (exactCount || 0) - hardMaxItems;
     const { data: oldest } = await supabase
       .from("memories")
       .select("id")
@@ -415,6 +418,10 @@ export async function runMemoryHealthCheck(
     if (ids.length) {
       await supabase.from("memories").delete().in("id", ids);
     }
+  }
+
+  if (!cleanupStaleEnabled) {
+    return;
   }
 
   const { data: staleRows } = await supabase

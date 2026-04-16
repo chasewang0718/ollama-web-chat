@@ -1,7 +1,7 @@
 'use client';
 import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 
 const WARMUP_INTERVAL_MS = 5 * 60 * 1000;
 const WARMUP_IDLE_STOP_MS = 30 * 60 * 1000;
@@ -20,13 +20,6 @@ type ConversationContextMenuState = {
   y: number;
 } | null;
 
-type MigrationTaskItem = {
-  conversation_id: string;
-  storage_backend: 'cloud' | 'local';
-  migration_status: 'none' | 'pending' | 'running' | 'failed' | 'done';
-  updated_at: string;
-};
-
 export default function Chat() {
   const { messages, setMessages, sendMessage, regenerate, stop, status, error, clearError } = useChat({
     transport: new DefaultChatTransport({ api: '/api/chat' }),
@@ -43,11 +36,10 @@ export default function Chat() {
   const [keepWarmEnabled, setKeepWarmEnabled] = useState(true);
   const lastActivityAtRef = useRef(Date.now());
   const [contextMenu, setContextMenu] = useState<ConversationContextMenuState>(null);
-  const [migrationItems, setMigrationItems] = useState<MigrationTaskItem[]>([]);
-  const [migrationOnlyFailed, setMigrationOnlyFailed] = useState(false);
-  const [migrationLoading, setMigrationLoading] = useState(false);
-  const [migrationRunning, setMigrationRunning] = useState(false);
-  const [migrationMessage, setMigrationMessage] = useState('');
+  const [storageMode, setStorageMode] = useState<'cloud' | 'local' | 'hybrid' | null>(null);
+  const [preferredCreateBackend, setPreferredCreateBackend] = useState<'cloud' | 'local'>('cloud');
+  const [editingUserMessageId, setEditingUserMessageId] = useState<string | null>(null);
+  const [editingUserMessageDraft, setEditingUserMessageDraft] = useState('');
   const isBusy = status === 'submitted' || status === 'streaming';
 
   const getBackendLabel = (backend: ConversationItem['storage_backend']) => {
@@ -56,72 +48,23 @@ export default function Chat() {
     return '未知';
   };
 
-  const loadMigrationItems = useCallback(async (onlyFailed = migrationOnlyFailed) => {
-    setMigrationLoading(true);
-    try {
-      const response = await fetch(
-        `/api/storage/migrations?mode=batch&limit=30&offset=0&onlyFailed=${onlyFailed ? 'true' : 'false'}`,
-        { cache: 'no-store' },
-      );
-      const data = (await response.json()) as { items?: MigrationTaskItem[]; error?: string };
-      if (!response.ok) {
-        setMigrationMessage(data.error || '迁移任务读取失败');
-        setMigrationItems([]);
-        return;
-      }
-      setMigrationItems(data.items || []);
-      setMigrationMessage('');
-    } catch {
-      setMigrationMessage('迁移任务读取失败');
-      setMigrationItems([]);
-    } finally {
-      setMigrationLoading(false);
-    }
-  }, [migrationOnlyFailed]);
+  /** Backend for POST /api/conversations when the user does not pick explicitly (e.g. blank auto-create, delete-last). */
+  const resolveImplicitCreateBackend = (): 'cloud' | 'local' | undefined => {
+    if (storageMode === null) return undefined;
+    if (storageMode === 'hybrid') return preferredCreateBackend;
+    return storageMode === 'local' ? 'local' : 'cloud';
+  };
 
-  const runBatchMigration = async (options: {
-    dryRun?: boolean;
-    onlyFailed?: boolean;
-    rollback?: boolean;
-  }) => {
-    setMigrationRunning(true);
-    setMigrationMessage('');
-    try {
-      const response = await fetch('/api/storage/migrations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          mode: 'batch',
-          targetBackend: 'local',
-          continueOnError: true,
-          limit: 30,
-          offset: 0,
-          onlyFailed: options.onlyFailed || false,
-          rollback: options.rollback || false,
-          dryRun: options.dryRun || false,
-        }),
-      });
-      const data = (await response.json()) as {
-        ok?: boolean;
-        total?: number;
-        succeeded?: number;
-        failed?: number;
-        error?: string;
-      };
-      if (!response.ok || !data.ok) {
-        setMigrationMessage(data.error || `迁移执行失败（成功 ${data.succeeded || 0} / ${data.total || 0}）`);
-      } else {
-        const modeLabel = options.dryRun ? 'DryRun' : options.rollback ? '回滚' : '迁移';
-        setMigrationMessage(
-          `${modeLabel}完成：成功 ${data.succeeded || 0}，失败 ${data.failed || 0}，总计 ${data.total || 0}`,
-        );
-      }
-    } catch {
-      setMigrationMessage('迁移执行失败');
-    } finally {
-      setMigrationRunning(false);
-      await loadMigrationItems(migrationOnlyFailed);
+  const buildCreateConversationRequest = (explicit?: 'cloud' | 'local'): RequestInit => {
+    const backend = explicit ?? resolveImplicitCreateBackend();
+    if (backend === undefined) {
+      return { method: 'POST' };
     }
+    return {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ storage_backend: backend }),
+    };
   };
 
   useEffect(() => {
@@ -146,11 +89,23 @@ export default function Chat() {
       setIsLoadingConversations(true);
       try {
         const response = await fetch('/api/conversations', { cache: 'no-store' });
-        const data = (await response.json()) as { conversations?: ConversationItem[]; error?: string };
+        const data = (await response.json()) as {
+          conversations?: ConversationItem[];
+          error?: string;
+          storage_mode?: 'cloud' | 'local' | 'hybrid';
+          default_new_conversation_backend?: 'cloud' | 'local';
+        };
         if (!response.ok) {
           setConversationsError(data.error || '会话功能暂不可用，请先执行 SQL 建表脚本。');
           setConversations([]);
           return;
+        }
+
+        if (data.storage_mode) {
+          setStorageMode(data.storage_mode);
+        }
+        if (data.default_new_conversation_backend) {
+          setPreferredCreateBackend(data.default_new_conversation_backend);
         }
 
         const list = data.conversations || [];
@@ -158,6 +113,7 @@ export default function Chat() {
         setConversationsError('');
 
         if (!list.length) {
+          // 首次无历史会话：由服务端按 STORAGE_MODE / 混合默认后端创建，避免与 storageMode 状态循环依赖。
           const created = await fetch('/api/conversations', { method: 'POST' });
           const createdData = (await created.json()) as {
             conversation?: { id: string; title: string; storage_backend?: 'cloud' | 'local' };
@@ -193,8 +149,7 @@ export default function Chat() {
 
     void loadModels();
     void loadConversations();
-    void loadMigrationItems(false);
-  }, [setMessages, loadMigrationItems]);
+  }, [setMessages]);
 
   useEffect(() => {
     const loadMessages = async () => {
@@ -232,14 +187,27 @@ export default function Chat() {
     void loadMessages();
   }, [activeConversationId, setMessages]);
 
-  const handleCreateConversation = async () => {
+  useEffect(() => {
+    setEditingUserMessageId(null);
+    setEditingUserMessageDraft('');
+  }, [activeConversationId]);
+
+  const handleCreateConversation = async (explicitBackend?: 'cloud' | 'local') => {
     if (isBusy) return;
+    const requestedBackend = explicitBackend ?? resolveImplicitCreateBackend();
+
     // 避免在“已是空白新会话”时重复创建会话壳。
     if (activeConversationId && messages.length === 0 && !isLoadingMessages) {
+      if (requestedBackend) {
+        setPreferredCreateBackend(requestedBackend);
+      }
       return;
     }
+    if (explicitBackend) {
+      setPreferredCreateBackend(explicitBackend);
+    }
 
-    const response = await fetch('/api/conversations', { method: 'POST' });
+    const response = await fetch('/api/conversations', buildCreateConversationRequest(requestedBackend));
     const data = (await response.json()) as {
       conversation?: { id: string; title: string; storage_backend?: 'cloud' | 'local' };
       error?: string;
@@ -249,6 +217,9 @@ export default function Chat() {
       return;
     }
     if (!data.conversation?.id) return;
+    if (data.conversation.storage_backend) {
+      setPreferredCreateBackend(data.conversation.storage_backend);
+    }
 
     const now = new Date().toISOString();
     setConversations((items) => [
@@ -269,7 +240,7 @@ export default function Chat() {
   };
 
   const createBlankConversation = async (): Promise<string | undefined> => {
-    const created = await fetch('/api/conversations', { method: 'POST' });
+    const created = await fetch('/api/conversations', buildCreateConversationRequest());
     const createdData = (await created.json()) as {
       conversation?: { id: string; title: string; storage_backend?: 'cloud' | 'local' };
       error?: string;
@@ -353,8 +324,6 @@ export default function Chat() {
           item.id === conversationId ? { ...item, storage_backend: targetBackend } : item,
         ),
       );
-      setMigrationMessage(`会话已迁移到${targetBackend === 'cloud' ? '云端' : '本地'}`);
-      await loadMigrationItems(migrationOnlyFailed);
     } catch {
       setConversationsError('迁移失败，请稍后重试。');
     }
@@ -377,6 +346,89 @@ export default function Chat() {
     ? conversations.find((item) => item.id === contextMenu.conversationId)
     : undefined;
   const migrationTarget = contextConversation?.storage_backend === 'local' ? 'cloud' : 'local';
+
+  const resolveRedoTextByMessageIndex = (index: number): string | undefined => {
+    const current = renderedMessages[index];
+    if (!current) return undefined;
+    if (current.role === 'user') {
+      return current.text.trim() || undefined;
+    }
+    for (let i = index - 1; i >= 0; i--) {
+      if (renderedMessages[i]?.role === 'user') {
+        return renderedMessages[i].text.trim() || undefined;
+      }
+    }
+    return undefined;
+  };
+
+  const handleRedoByMessageIndex = async (index: number) => {
+    if (isBusy || !activeConversationId) return;
+    const redoText = resolveRedoTextByMessageIndex(index);
+    if (!redoText) return;
+    if (error) clearError();
+    lastActivityAtRef.current = Date.now();
+    await sendMessage(
+      { text: redoText },
+      { body: { model: selectedModel, conversationId: activeConversationId } },
+    );
+  };
+
+  const handleCopyMessageText = async (text: string) => {
+    if (!text.trim()) return;
+    try {
+      await navigator.clipboard?.writeText(text);
+    } catch {
+      // ignore clipboard failures in unsupported contexts
+    }
+  };
+
+  const handleBeginEditUserMessage = (messageId: string, originalText: string) => {
+    setEditingUserMessageId(messageId);
+    setEditingUserMessageDraft(originalText);
+  };
+
+  const handleCancelEditUserMessage = () => {
+    setEditingUserMessageId(null);
+    setEditingUserMessageDraft('');
+  };
+
+  const handleApplyEditedUserMessage = async () => {
+    if (!editingUserMessageId || !activeConversationId || isBusy) return;
+    const value = editingUserMessageDraft.trim();
+    if (!value) return;
+
+    const targetIndex = messages.findIndex((item) => item.id === editingUserMessageId && item.role === 'user');
+    if (targetIndex < 0) {
+      handleCancelEditUserMessage();
+      return;
+    }
+
+    // Re-input behavior: trim conversation from edited turn and re-run from the updated user text.
+    setMessages(messages.slice(0, targetIndex));
+    handleCancelEditUserMessage();
+    if (error) clearError();
+    lastActivityAtRef.current = Date.now();
+    await sendMessage(
+      { text: value },
+      { body: { model: selectedModel, conversationId: activeConversationId } },
+    );
+  };
+
+  const renderMessageText = (text: string) => {
+    const paragraphs = text.split(/\n{2,}/).filter((p) => p.trim().length > 0);
+    if (!paragraphs.length) return null;
+
+    return paragraphs.map((paragraph, index) => (
+      <p key={index} className="mb-4 last:mb-0">
+        {paragraph.split('\n').map((line, lineIndex) => (
+          <span key={lineIndex}>
+            {line}
+            {lineIndex < paragraph.split('\n').length - 1 ? <br /> : null}
+          </span>
+        ))}
+      </p>
+    ));
+  };
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -464,14 +516,57 @@ export default function Chat() {
   return (
     <div className="flex h-screen overflow-hidden bg-slate-50 text-slate-900">
       <aside className="hidden h-full w-72 flex-col border-r border-slate-200 bg-[#f7f8fa] p-4 md:flex">
-        <button
-          type="button"
-          className="mb-4 rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:bg-slate-400"
-          onClick={() => void handleCreateConversation()}
-          disabled={isBusy}
-        >
-          + 发起新对话
-        </button>
+        {storageMode === 'hybrid' ? (
+          <div className="mb-4 grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              className={`rounded-xl px-2 py-2 text-xs font-medium transition sm:text-sm ${
+                preferredCreateBackend === 'cloud'
+                  ? 'bg-slate-900 text-white ring-2 ring-slate-300'
+                  : 'border border-slate-300 bg-white text-slate-800 hover:bg-slate-50'
+              } disabled:bg-slate-400 disabled:text-slate-200`}
+              onClick={() => void handleCreateConversation('cloud')}
+              disabled={isBusy || isLoadingConversations}
+            >
+              新对话 · 云端
+              {preferredCreateBackend === 'cloud' && (
+                <span className="ml-1 align-middle text-[10px] text-slate-200">当前</span>
+              )}
+            </button>
+            <button
+              type="button"
+              className={`rounded-xl px-2 py-2 text-xs font-medium transition sm:text-sm ${
+                preferredCreateBackend === 'local'
+                  ? 'bg-slate-900 text-white ring-2 ring-slate-300'
+                  : 'border border-slate-300 bg-white text-slate-800 hover:bg-slate-50'
+              } disabled:bg-slate-400 disabled:text-slate-200`}
+              onClick={() => void handleCreateConversation('local')}
+              disabled={isBusy || isLoadingConversations}
+            >
+              新对话 · 本地
+              {preferredCreateBackend === 'local' && (
+                <span className="ml-1 align-middle text-[10px] text-slate-200">当前</span>
+              )}
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            className="mb-4 w-full rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:bg-slate-400"
+            onClick={() =>
+              void handleCreateConversation(
+                storageMode === 'local' ? 'local' : storageMode === 'cloud' ? 'cloud' : undefined,
+              )
+            }
+            disabled={isBusy || isLoadingConversations}
+          >
+            {storageMode === 'local'
+              ? '+ 发起新对话（本地）'
+              : storageMode === 'cloud'
+                ? '+ 发起新对话（云端）'
+                : '+ 发起新对话'}
+          </button>
+        )}
         <p className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-500">历史对话</p>
         <div
           className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1"
@@ -558,227 +653,321 @@ export default function Chat() {
           )}
           {conversationsError && <p className="px-2 py-2 text-xs text-amber-600">{conversationsError}</p>}
 
-          <div className="mt-4 rounded-xl border border-slate-200 bg-white p-2">
-            <div className="mb-2 flex items-center justify-between">
-              <p className="text-xs font-medium text-slate-600">迁移任务</p>
-              <button
-                type="button"
-                className="text-[11px] text-slate-500 hover:text-slate-700"
-                onClick={() => void loadMigrationItems(migrationOnlyFailed)}
-                disabled={migrationLoading || migrationRunning}
-              >
-                刷新
-              </button>
-            </div>
-            <label className="mb-2 inline-flex items-center gap-1 text-[11px] text-slate-500">
-              <input
-                type="checkbox"
-                checked={migrationOnlyFailed}
-                onChange={(event) => {
-                  const checked = event.target.checked;
-                  setMigrationOnlyFailed(checked);
-                  void loadMigrationItems(checked);
-                }}
-                className="h-3 w-3 rounded border-slate-300"
-                disabled={migrationLoading || migrationRunning}
-              />
-              仅失败项
-            </label>
-            <div className="mb-2 flex flex-wrap gap-1">
-              <button
-                type="button"
-                className="rounded-md border border-slate-300 px-2 py-1 text-[11px] text-slate-700 hover:bg-slate-50 disabled:text-slate-400"
-                onClick={() => void runBatchMigration({ dryRun: true, onlyFailed: migrationOnlyFailed })}
-                disabled={migrationRunning}
-              >
-                DryRun
-              </button>
-              <button
-                type="button"
-                className="rounded-md border border-slate-300 px-2 py-1 text-[11px] text-slate-700 hover:bg-slate-50 disabled:text-slate-400"
-                onClick={() => void runBatchMigration({ onlyFailed: migrationOnlyFailed })}
-                disabled={migrationRunning}
-              >
-                批量迁移
-              </button>
-              <button
-                type="button"
-                className="rounded-md border border-amber-300 px-2 py-1 text-[11px] text-amber-700 hover:bg-amber-50 disabled:text-slate-400"
-                onClick={() => void runBatchMigration({ rollback: true, onlyFailed: migrationOnlyFailed })}
-                disabled={migrationRunning}
-              >
-                批量回滚
-              </button>
-            </div>
-            {migrationMessage && <p className="mb-2 text-[11px] text-slate-600">{migrationMessage}</p>}
-            <div className="max-h-36 space-y-1 overflow-y-auto">
-              {migrationLoading && <p className="text-[11px] text-slate-400">任务加载中...</p>}
-              {!migrationLoading && migrationItems.length === 0 && (
-                <p className="text-[11px] text-slate-400">暂无迁移任务</p>
-              )}
-              {!migrationLoading &&
-                migrationItems.map((item) => (
-                  <div key={item.conversation_id} className="rounded-md bg-slate-50 px-2 py-1 text-[11px]">
-                    <p className="truncate text-slate-700">{item.conversation_id}</p>
-                    <p className="text-slate-500">
-                      {item.storage_backend} / {item.migration_status}
-                    </p>
-                    <p className="text-slate-400">{new Date(item.updated_at).toLocaleString()}</p>
-                  </div>
-                ))}
-            </div>
-          </div>
         </div>
       </aside>
 
-      <main className="h-full w-full overflow-y-auto px-4 pb-40 pt-8">
-        <div className="mx-auto flex w-full max-w-4xl flex-col">
-        <header className="mb-6">
-          <div className="mb-3 flex items-center justify-between gap-3 md:hidden">
-            <button
-              type="button"
-              className="rounded-xl bg-slate-900 px-3 py-2 text-xs font-medium text-white"
-              onClick={() => void handleCreateConversation()}
-              disabled={isBusy}
-            >
-              + 新对话
-            </button>
-            <span className="text-xs text-slate-400">{conversations.length} 个会话</span>
-          </div>
-          <p className="text-sm font-medium text-slate-500">本地 AI 助手（Ollama）</p>
-          {renderedMessages.length === 0 && (
-            <h1 className="mt-1 text-3xl font-semibold tracking-tight text-slate-800">今天想让我帮你做什么？</h1>
-          )}
-        </header>
-
-        <section className="space-y-4" onWheel={(event) => event.stopPropagation()}>
-          {renderedMessages.length === 0 && isLoadingMessages && (
-            <div className="rounded-2xl border border-slate-200 bg-white p-5 text-sm text-slate-500 shadow-sm">
-              正在加载会话...
+      <div className="flex h-full min-w-0 flex-1 flex-col">
+        <main className="min-h-0 flex-1 overflow-y-auto px-4 pt-8">
+          <div className="mx-auto flex w-full max-w-3xl flex-col pb-8">
+          <header className="mb-6">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2 md:hidden">
+              {storageMode === 'hybrid' ? (
+                <div className="flex flex-wrap gap-1.5">
+                  <button
+                    type="button"
+                    className={`rounded-lg px-2.5 py-1.5 text-xs font-medium transition ${
+                      preferredCreateBackend === 'cloud'
+                        ? 'bg-slate-900 text-white ring-2 ring-slate-300'
+                        : 'border border-slate-300 bg-white text-slate-800'
+                    } disabled:bg-slate-400 disabled:text-slate-200`}
+                    onClick={() => void handleCreateConversation('cloud')}
+                    disabled={isBusy || isLoadingConversations}
+                  >
+                    新对话 · 云端
+                    {preferredCreateBackend === 'cloud' && <span className="ml-1 text-[10px] text-slate-200">当前</span>}
+                  </button>
+                  <button
+                    type="button"
+                    className={`rounded-lg px-2.5 py-1.5 text-xs font-medium transition ${
+                      preferredCreateBackend === 'local'
+                        ? 'bg-slate-900 text-white ring-2 ring-slate-300'
+                        : 'border border-slate-300 bg-white text-slate-800'
+                    } disabled:bg-slate-400 disabled:text-slate-200`}
+                    onClick={() => void handleCreateConversation('local')}
+                    disabled={isBusy || isLoadingConversations}
+                  >
+                    新对话 · 本地
+                    {preferredCreateBackend === 'local' && <span className="ml-1 text-[10px] text-slate-200">当前</span>}
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="rounded-xl bg-slate-900 px-3 py-2 text-xs font-medium text-white disabled:bg-slate-400"
+                  onClick={() =>
+                    void handleCreateConversation(
+                      storageMode === 'local' ? 'local' : storageMode === 'cloud' ? 'cloud' : undefined,
+                    )
+                  }
+                  disabled={isBusy || isLoadingConversations}
+                >
+                  {storageMode === 'local' ? '+ 新对话（本地）' : storageMode === 'cloud' ? '+ 新对话（云端）' : '+ 新对话'}
+                </button>
+              )}
+              <span className="text-xs text-slate-400">{conversations.length} 个会话</span>
             </div>
-          )}
+            <p className="text-sm font-medium text-slate-500">本地 AI 助手（Ollama）</p>
+            {renderedMessages.length === 0 && (
+              <h1 className="mt-1 text-3xl font-semibold tracking-tight text-slate-800">今天想让我帮你做什么？</h1>
+            )}
+          </header>
 
-          {renderedMessages.map((message) => {
-            const isUser = message.role === 'user';
-            return (
-              <div key={message.id} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
-                {isUser ? (
-                  <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl bg-slate-200 px-4 py-3 text-sm leading-6 text-slate-900 shadow-sm">
-                    {message.text}
-                  </div>
-                ) : (
-                  <div className="w-full px-2 py-1 text-sm leading-7 text-slate-800">
-                    <div className="mb-2 flex items-center gap-2 text-slate-500">
-                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-slate-300 bg-white text-slate-900 shadow-sm">
-                        <svg viewBox="0 0 64 64" className="h-6 w-6" aria-hidden="true">
-                          <g fill="none" stroke="currentColor" strokeWidth="3.2" strokeLinecap="round" strokeLinejoin="round">
-                            <path d="M20 18v10" />
-                            <path d="M44 18v10" />
-                            <path d="M16 29c0-10 7-16 16-16s16 6 16 16v16c0 8-6 14-14 14h-4c-8 0-14-6-14-14V29z" />
-                            <circle cx="25" cy="34" r="1.6" fill="currentColor" />
-                            <circle cx="39" cy="34" r="1.6" fill="currentColor" />
-                            <ellipse cx="32" cy="41" rx="9" ry="6" />
-                            <circle cx="32" cy="41" r="1.8" fill="currentColor" />
-                          </g>
-                        </svg>
-                      </span>
-                      <span className="text-xs font-medium text-slate-500">助手回复</span>
+          <section className="space-y-4" onWheel={(event) => event.stopPropagation()}>
+            {renderedMessages.length === 0 && isLoadingMessages && (
+              <div className="rounded-2xl border border-slate-200 bg-white p-5 text-sm text-slate-500 shadow-sm">
+                正在加载会话...
+              </div>
+            )}
+
+            {renderedMessages.map((message, index) => {
+              const isUser = message.role === 'user';
+              return (
+                <div key={message.id} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
+                  {isUser ? (
+                    <div className="flex max-w-[85%] items-end gap-2">
+                      <div className="flex items-center gap-2 pb-1">
+                        <button
+                          type="button"
+                          title="编辑"
+                          aria-label="编辑"
+                          className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-300 bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-900 disabled:text-slate-300"
+                          onClick={() => handleBeginEditUserMessage(message.id, message.text)}
+                          disabled={isBusy}
+                        >
+                          <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" aria-hidden="true">
+                            <path
+                              d="M4 20h4l10-10-4-4L4 16v4zM13 7l4 4"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1.8"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                          </svg>
+                        </button>
+                        <button
+                          type="button"
+                          title="复制回答"
+                          aria-label="复制回答"
+                          className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-300 bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-900"
+                          onClick={() => void handleCopyMessageText(message.text)}
+                        >
+                          <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" aria-hidden="true">
+                            <rect
+                              x="9"
+                              y="9"
+                              width="11"
+                              height="11"
+                              rx="2"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1.8"
+                            />
+                            <path
+                              d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1.8"
+                              strokeLinecap="round"
+                            />
+                          </svg>
+                        </button>
+                      </div>
+                      {editingUserMessageId === message.id ? (
+                        <div className="w-[min(85vw,640px)] rounded-2xl border-2 border-blue-500 bg-white px-4 py-3 text-base leading-6 text-slate-900 shadow-sm">
+                          <textarea
+                            className="min-h-24 w-full resize-y rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-400"
+                            value={editingUserMessageDraft}
+                            onChange={(event) => setEditingUserMessageDraft(event.target.value)}
+                            disabled={isBusy}
+                          />
+                          <div className="mt-3 flex items-center justify-end gap-4">
+                            <button
+                              type="button"
+                              className="text-sm text-slate-500 hover:text-slate-700 disabled:text-slate-300"
+                              onClick={handleCancelEditUserMessage}
+                              disabled={isBusy}
+                            >
+                              取消
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-full bg-slate-200 px-4 py-1.5 text-sm text-slate-700 hover:bg-slate-300 disabled:text-slate-400"
+                              onClick={() => void handleApplyEditedUserMessage()}
+                              disabled={isBusy || !editingUserMessageDraft.trim()}
+                            >
+                              更新
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="rounded-2xl bg-slate-200 px-4 py-3 text-base leading-6 text-slate-900 shadow-sm">
+                          {renderMessageText(message.text)}
+                        </div>
+                      )}
                     </div>
-                    <div className="whitespace-pre-wrap">{message.text}</div>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </section>
-        </div>
-      </main>
-
-      <form
-        onSubmit={handleSubmit}
-        className="fixed inset-x-0 bottom-0 border-t border-slate-200 bg-white/90 backdrop-blur md:left-72"
-      >
-        <div className="mx-auto w-full max-w-4xl px-4 py-4">
-          <div className="rounded-3xl border border-slate-300 bg-white px-4 py-3 shadow-sm">
-            <textarea
-              className="max-h-40 min-h-12 w-full resize-y bg-transparent text-sm text-slate-900 outline-none transition disabled:bg-slate-100"
-              value={input}
-              placeholder="输入你的问题，回车发送（Shift+Enter 换行）"
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey) {
-                  event.preventDefault();
-                  void handleSubmit(event as unknown as FormEvent<HTMLFormElement>);
-                }
-              }}
-              disabled={isBusy || !activeConversationId}
-            />
-            <div className="mt-3 flex items-center justify-between gap-3 border-t border-slate-100 pt-3">
-              <div className="flex items-center gap-3">
-                <label htmlFor="model-select" className="text-xs font-medium text-slate-500">
-                  当前模型
-                </label>
-                <select
-                  id="model-select"
-                  value={selectedModel}
-                  onChange={(event) => setSelectedModel(event.target.value)}
-                  className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700"
-                  disabled={isBusy || models.length === 0}
-                >
-                  {models.length === 0 ? (
-                    <option value={selectedModel}>{selectedModel}</option>
                   ) : (
-                    models.map((model) => (
-                      <option key={model} value={model}>
-                        {model}
-                      </option>
-                    ))
+                    <div className="w-full px-2 py-1 text-base leading-6 text-slate-800">
+                      <div className="mb-2 flex items-center gap-2 text-slate-500">
+                        <span className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-slate-300 bg-white text-slate-900 shadow-sm">
+                          <svg viewBox="0 0 64 64" className="h-6 w-6" aria-hidden="true">
+                            <g fill="none" stroke="currentColor" strokeWidth="3.2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M20 18v10" />
+                              <path d="M44 18v10" />
+                              <path d="M16 29c0-10 7-16 16-16s16 6 16 16v16c0 8-6 14-14 14h-4c-8 0-14-6-14-14V29z" />
+                              <circle cx="25" cy="34" r="1.6" fill="currentColor" />
+                              <circle cx="39" cy="34" r="1.6" fill="currentColor" />
+                              <ellipse cx="32" cy="41" rx="9" ry="6" />
+                              <circle cx="32" cy="41" r="1.8" fill="currentColor" />
+                            </g>
+                          </svg>
+                        </span>
+                        <span className="text-xs font-medium text-slate-500">助手回复</span>
+                      </div>
+                      <div>{renderMessageText(message.text)}</div>
+                      <div className="mt-3 flex items-center justify-start gap-2 border-t border-slate-200 pt-2">
+                        <button
+                          type="button"
+                          title="重做"
+                          aria-label="重做"
+                          className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-300 bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-900 disabled:text-slate-300"
+                          onClick={() => void handleRedoByMessageIndex(index)}
+                          disabled={isBusy || !activeConversationId}
+                        >
+                          <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" aria-hidden="true">
+                            <path
+                              d="M9 8H5V4M5 8a8 8 0 1 1-1 4"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1.8"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                          </svg>
+                        </button>
+                        <button
+                          type="button"
+                          title="复制回答"
+                          aria-label="复制回答"
+                          className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-300 bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-900"
+                          onClick={() => void handleCopyMessageText(message.text)}
+                        >
+                          <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" aria-hidden="true">
+                            <rect
+                              x="9"
+                              y="9"
+                              width="11"
+                              height="11"
+                              rx="2"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1.8"
+                            />
+                            <path
+                              d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1.8"
+                              strokeLinecap="round"
+                            />
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
                   )}
-                </select>
-                <label className="inline-flex items-center gap-1 text-xs text-slate-500">
-                  <input
-                    type="checkbox"
-                    checked={keepWarmEnabled}
-                    onChange={(event) => setKeepWarmEnabled(event.target.checked)}
-                    className="h-3.5 w-3.5 rounded border-slate-300"
-                  />
-                  常热
-                </label>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  className="h-10 rounded-xl border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:text-slate-400"
-                  onClick={() => stop()}
-                  disabled={!isBusy}
-                >
-                  停止
-                </button>
-                <button
-                  type="button"
-                  className="h-10 rounded-xl border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:text-slate-400"
-                  onClick={() => void handleRetry()}
-                  disabled={!canRetry || !activeConversationId}
-                >
-                  重试
-                </button>
-                <button
-                  type="submit"
-                  className="h-10 rounded-xl bg-slate-900 px-4 text-xs font-medium text-white transition hover:bg-slate-700 disabled:bg-slate-400"
-                  disabled={isBusy || !input.trim() || !activeConversationId}
-                >
-                  发送
-                </button>
+                </div>
+              );
+            })}
+          </section>
+          </div>
+        </main>
+
+        <form
+          onSubmit={handleSubmit}
+          className="shrink-0 border-t border-slate-200 bg-white/90 backdrop-blur"
+        >
+          <div className="mx-auto w-full max-w-3xl px-4 py-4">
+            <div className="rounded-3xl border border-slate-300 bg-white px-4 py-3 shadow-sm">
+              <textarea
+                className="max-h-40 min-h-12 w-full resize-y bg-transparent text-sm text-slate-900 outline-none transition disabled:bg-slate-100"
+                value={input}
+                placeholder="输入你的问题，回车发送（Shift+Enter 换行）"
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    void handleSubmit(event as unknown as FormEvent<HTMLFormElement>);
+                  }
+                }}
+                disabled={isBusy || !activeConversationId}
+              />
+              <div className="mt-3 flex items-center justify-between gap-3 border-t border-slate-100 pt-3">
+                <div className="flex items-center gap-3">
+                  <label htmlFor="model-select" className="text-xs font-medium text-slate-500">
+                    当前模型
+                  </label>
+                  <select
+                    id="model-select"
+                    value={selectedModel}
+                    onChange={(event) => setSelectedModel(event.target.value)}
+                    className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700"
+                    disabled={isBusy || models.length === 0}
+                  >
+                    {models.length === 0 ? (
+                      <option value={selectedModel}>{selectedModel}</option>
+                    ) : (
+                      models.map((model) => (
+                        <option key={model} value={model}>
+                          {model}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                  <label className="inline-flex items-center gap-1 text-xs text-slate-500">
+                    <input
+                      type="checkbox"
+                      checked={keepWarmEnabled}
+                      onChange={(event) => setKeepWarmEnabled(event.target.checked)}
+                      className="h-3.5 w-3.5 rounded border-slate-300"
+                    />
+                    常热
+                  </label>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    className="h-10 rounded-xl border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:text-slate-400"
+                    onClick={() => stop()}
+                    disabled={!isBusy}
+                  >
+                    停止
+                  </button>
+                  <button
+                    type="button"
+                    className="h-10 rounded-xl border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:text-slate-400"
+                    onClick={() => void handleRetry()}
+                    disabled={!canRetry || !activeConversationId}
+                  >
+                    重试
+                  </button>
+                  <button
+                    type="submit"
+                    className="h-10 rounded-xl bg-slate-900 px-4 text-xs font-medium text-white transition hover:bg-slate-700 disabled:bg-slate-400"
+                    disabled={isBusy || !input.trim() || !activeConversationId}
+                  >
+                    发送
+                  </button>
+                </div>
               </div>
             </div>
           </div>
-        </div>
-        <div className="mx-auto w-full max-w-4xl px-4 pb-4 text-xs">
-          {isBusy && <p className="text-slate-500">AI 正在回复...</p>}
-          {modelsError && <p className="text-amber-600">{modelsError}</p>}
-          {error && <p className="text-red-500">连接失败，请确认 Ollama 服务已启动。</p>}
-        </div>
-      </form>
+          <div className="mx-auto w-full max-w-3xl px-4 pb-4 text-xs">
+            {isBusy && <p className="text-slate-500">AI 正在回复...</p>}
+            {modelsError && <p className="text-amber-600">{modelsError}</p>}
+            {error && <p className="text-red-500">连接失败，请确认 Ollama 服务已启动。</p>}
+          </div>
+        </form>
+      </div>
 
       {contextMenu && (
         <div
