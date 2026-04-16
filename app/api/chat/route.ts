@@ -540,7 +540,7 @@ export async function POST(req: Request) {
     }
 
     const storage = getStorageProviderForBackend(selectedBackend);
-    const release = await acquireOllamaExclusive();
+    const release = await acquireOllamaExclusive({ signal: req.signal });
     try {
       const activeModel = model || modelName;
       let runtimeModel = activeModel;
